@@ -1,5 +1,9 @@
 # GA HNN nDxnD Engine Archive
 
+> **Status: Lane2048 is now integrated into V26 production** (commit ec70125).
+> This repository serves as the historical archive of the nDxnD engine evolution.
+> The production code lives in src/control/living_silicon.hpp and .cpp in the V26 repository.
+
 Complete evolution archive of the **GA + HNN nDxnD** engine family — 28 versions spanning 5 architectural eras, from Father/Son hierarchical GA to the **Lane2048 Living Topology** engine.
 
 ## Purpose
@@ -147,9 +151,9 @@ void mutate_topology_blocks(Lane2048& lane, std::uint32_t& rng) {
 | SIMD blocks | 128 (16 nodes each) |
 | Neighbors per block | 4 slots |
 | Population lanes | 8 |
-| Tick speed | 26,456 ticks/s (benchmark) |
+| Tick speed | 20,805 ticks/s (production benchmark) |
 | Per-tick latency | ~38 μs (epoch-level) |
-| Mutations/s | 385 |
+| Mutations/s | 312 |
 | Instruction set | AVX2 (256-bit, int16) |
 | Compiler | MSVC C++20 `/arch:AVX2` |
 
