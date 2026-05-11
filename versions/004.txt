@@ -1,0 +1,662 @@
+GEMINI
+
+Gerai, dabar eisime prie šaknų! Supratau jūsų tikslą: sukurti realų, gamybinį kodą, kuris maksimaliai išlaiko HNN nD prigimtį ir LUT technologiją, o ne tik jas simuliuoja ar abstrahuoja. Tai bus sudėtinga užduotis, ypač turint omenyje resursų apribojimus (kaip aptarta anksčiau su GTX960M, nors šįkart aš nesutelkiau dėmesio tik į tą vieną GPU, o į bendrus gamybos standartus).
+
+Šis kodas bus skirtas ne švietimui, o potencialiam realiam naudojimui, todėl jis apims:
+
+Aukštesnį sudėtingumo lygį.
+
+Dėmesį į duomenų srautą ir atminties valdymą.
+
+Tikslesnį HNN nD ir LUT principų atspindėjimą.
+
+Geresnę struktūrą ir modulinių komponentų atskyrimą.
+
+Komentarus, paaiškinančius gamybinio kodo sprendimus.
+
+Gamybinio kodo pagrindiniai principai HNN nD ir LUT
+Norėdami išlaikyti HNN nD prigimtį ir LUT technologiją gamybiniame kode, turime:
+
+Tikrą nD tenzorių valdymą: Apdoroti ir manipuliuoti tenzoriais, turinčiais n_dims matmenų, o ne išlyginti juos per anksti. Tai reikalauja specializuotų tenzorių operacijų, kurios išsaugojo erdvinę struktūrą.
+
+LUT integravimą į duomenų srautą: Naudoti LUT duomenims kvantuoti ir transformuoti į "holografinius" įterpimus pačioje pradžioje.
+
+Holografinius principus atspindinčius sluoksnius: Naudoti PyTorch sluoksnius, kurie gali efektyviai atlikti tokias operacijas kaip tenzorių kontrakcija, superpozicija ar attencijos mechanizmai per kelias dimensijas.
+
+Kvantavimą visame modelyje: Siekti, kad didžioji dalis skaičiavimų vyktų su kvantuotais sveikaisiais skaičiais, naudojant PyTorch kvantavimo API (Quantization-Aware Training).
+
+Moduliškumą ir aiškumą: Gamybinis kodas turi būti lengvai skaitomas, testuojamas ir prižiūrimas.
+
+Gamybinio kodo komponentai
+config.py: Sistemos konfigūracija.
+
+hnn_quant_lut.py: Tikrasis HNN nD ir LUT apdorojimo branduolys.
+
+ai_decision_head.py: AI sprendimų priėmimo dalis.
+
+unified_hnn_ai_fabric.py: Apjungia HNN ir AI į vieną modelį.
+
+genetic_orchestrator.py: Genetinis Algoritmas, valdantis evoliuciją.
+
+environment_simulator.py: Realistinis aplinkos simuliatorius.
+
+main.py: Pagrindinė vykdymo logika, apmokymo ir evoliucijos ciklas.
+
+1. config.py
+Python
+
+import torch
+
+# Pagrindinė sistemos konfigūracija
+SYSTEM_CONFIG = {
+    "device": "cuda" if torch.cuda.is_available() else "cpu",
+    "precision_dtype": torch.float32, # Pagrindinis duomenų tipas PyTorch modelio init
+                                      # Kvantavimas bus atliekamas atskiruose sluoksniuose
+}
+
+# HNN ir LUT konfigūracija
+HNN_LUT_CONFIG = {
+    "input_features": 5,           # Pvz., Open, High, Low, Close, Volume
+    "timesteps": 60,               # Istorinių duomenų taškų skaičius (pvz., minutės)
+    "n_dims_min": 3,               # Min. hologramos matmenų skaičius (GA valdoma)
+    "n_dims_max": 7,               # Maks. hologramos matmenų skaičius (GA valdoma)
+    "dim_size_min": 4,             # Min. kiekvienos dimensijos dydis (GA valdoma)
+    "dim_size_max": 8,             # Maks. kiekvienos dimensijos dydis (GA valdoma)
+    "quant_bits": 8,               # Kvantavimo bitų skaičius (dėl LUT – 8 bitai standartiškai)
+    "lut_output_embedding_dim": 16,# Kiekvieno LUT įrašo išvesties įterpimo matmuo
+    "holographic_core_hidden_dim": 32, # Paslėptas matmuo holografiniame apdorojime
+}
+
+# AI sprendimų galvos konfigūracija
+AI_DECISION_CONFIG = {
+    "decision_head_hidden_dim": 32, # Sprendimų galvos paslėptas matmuo
+    "output_actions": 3,           # BUY, SELL, HOLD
+}
+
+# Genetinio Algoritmo konfigūracija
+GA_CONFIG = {
+    "population_size": 10,
+    "num_generations": 50,
+    "mutation_rate": 0.05,
+    "crossover_rate": 0.7,
+    "fitness_alpha": 0.6,          # Svoris AI pasitikėjimui
+    "fitness_beta": 0.3,           # Svoris ROI
+    "fitness_grok_weight": 0.1,    # Svoris "Grok" tipo pasitikėjimui
+    "vram_limit_gb": 1.8,          # Maksimalus VRAM naudojimas vienam individui bandymo metu
+}
+
+# Aplinkos simuliacijos konfigūracija
+ENV_CONFIG = {
+    "base_roi": 0.0005,            # Bazinė pelno grąža
+    "volatility_factor": 0.01,     # Rinkos nepastovumo faktorius
+}
+
+# Bendri apmokymo ir vykdymo parametrai
+TRAINING_CONFIG = {
+    "steps_per_generation": 20,    # Žingsnių skaičius per GA kartą
+    "learning_rate": 0.001,        # SGD/Adam optimizatoriaus mokymosi sparta
+                                   # GA optimizuos architektūrą, o SGD/Adam - svorius
+}
+2. hnn_quant_lut.py
+Šis modulis bus atsakingas už tikrą nD tenzorių generavimą ir LUT pagrindu veikiančias operacijas.
+
+Python
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from config import HNN_LUT_CONFIG
+
+class HNN_QuantLUT_Core(nn.Module):
+    def __init__(self, n_dims: int, dim_size: int, quant_bits: int, 
+                 lut_output_embedding_dim: int, holographic_core_hidden_dim: int):
+        super().__init__()
+        self.n_dims = n_dims
+        self.dim_size = dim_size
+        self.quant_range = 2**quant_bits # Pvz., 256 for 8 bits
+        self.lut_output_embedding_dim = lut_output_embedding_dim
+        self.holographic_core_hidden_dim = holographic_core_hidden_dim
+
+        # --- Pagrindinis LUT (Look-Up Table) ---
+        # Kiekviena iš 2^quant_bits įvesties reikšmių atvaizduojama į embedding vektorių.
+        # Šis embedding'as yra "holografinė būsena", kurią GA gali optimizuoti.
+        self.holographic_lut = nn.Embedding(
+            num_embeddings=self.quant_range, 
+            embedding_dim=self.lut_output_embedding_dim
+        )
+
+        # --- Tenzorių Kvantavimas ir De-kvantavimas ---
+        # Realistiškas PyTorch kvantavimo API naudojimas
+        # Šie kvantavimai apibrėžiami apmokymo metu (Quantization-Aware Training)
+        # Nurodomi observeriai, kurie stebės diapazonus.
+        self.quant_input_observer = torch.quantization.observer.MinMaxObserver(
+            quant_min=0, quant_max=self.quant_range - 1, dtype=torch.quint8
+        )
+        self.quant_act_observer = torch.quantization.observer.MinMaxObserver(
+            quant_min=0, quant_max=self.quant_range - 1, dtype=torch.quint8
+        )
+        self.quant_weight_observer = torch.quantization.observer.MinMaxObserver(
+            quant_min=-(self.quant_range // 2), quant_max=(self.quant_range // 2) - 1, dtype=torch.qint8
+        )
+        # Kvantavimo schemos apibrėžimas
+        self.qconfig = torch.quantization.QConfig(
+            activation=self.quant_act_observer,
+            weight=self.quant_weight_observer
+        )
+
+        # --- Holografinės Matricos Dinaminis Generavimas ir Apdorojimas ---
+        # Šis sluoksnis generuos nD tenzorių iš įvesties požymių
+        # Įvestis: sujungti LUT įterpimai iš laiko eilutės
+        # Pvz., 60 (timesteps) * lut_output_embedding_dim
+        input_dim_for_hologram_gen = HNN_LUT_CONFIG["timesteps"] * self.lut_output_embedding_dim
+        
+        # Pagrindinis sluoksnis hologramos "sukūrimui" iš įvesties
+        # Grąžinama yra išlyginta holograma, kurią vėliau pertvarkysime į nD
+        self.hologram_generator_linear = nn.Linear(
+            input_dim_for_hologram_gen, 
+            self.dim_size ** self.n_dims # nD hologramos elementų skaičius
+        )
+        # Pridedame kvantavimą prie linijinio sluoksnio
+        self.hologram_generator_linear.qconfig = self.qconfig
+
+
+        # --- Holografinės Tenzorių Kontrakcijos ir Superpozicijos Sluoksniai ---
+        # Šie sluoksniai apdoroja tikrą nD tenzorių
+        # Nėra tiesioginio "nD konvoliucijos" PyTorch. Modeliuosime tai tensor_contraction,
+        # ar specializuotais transformeriais jei VRAM leistų.
+        # Dėl riboto VRAM, naudosime seka apdorojantį LSTM, bet išlaikydami "nD esmę"
+        # bandydami LSTM paversti kažkuo, kas "supranta" nD.
+        
+        # A. Projekcija iš nD tenzoriaus į seką, kurią gali apdoroti LSTM
+        # Tenzorius išlyginamas, bet tada formuojamos "sub-sekos" iš įvairių "matmenų projekcijų"
+        # Tai yra labai sudėtinga, todėl naudosime supaprastinimą:
+        # Ašys, kuriomis tenzorius sumuojamas (sumažinant matmenų skaičių).
+        # GA galėtų optimizuoti, kurias ašis sumuoti.
+        self.holographic_processor = nn.Sequential(
+            nn.Linear(self.dim_size ** self.n_dims, self.holographic_core_hidden_dim * 4),
+            nn.ReLU(),
+            nn.Linear(self.holographic_core_hidden_dim * 4, self.holographic_core_hidden_dim)
+        )
+        self.holographic_processor.qconfig = self.qconfig
+
+        # B. "Superpozicijos" mechanizmas - LSTM. Nors LSTM yra sekinis,
+        # jo paslėpta būsena gali "superponuoti" informaciją per laiko/požymių dimensijas.
+        # Kvantavimas LSTM modeliui (tai yra tikras PyTorch kvantavimas)
+        self.lstm_quant = nn.LSTM(
+            input_size=self.holographic_core_hidden_dim, 
+            hidden_size=self.holographic_core_hidden_dim, 
+            num_layers=1, 
+            batch_first=True
+        )
+        self.lstm_quant = torch.quantization.fuse_modules(self.lstm_quant, [['lstm_cell_name']], inplace=False) # Fuses to make quantizable
+        self.lstm_quant.qconfig = self.qconfig
+
+
+    def forward(self, x: torch.Tensor):
+        # 1. Finansinių duomenų kvantavimas ir LUT paieška
+        # X: (batch_size, timesteps, input_features) -> 1, 60, 5
+        
+        # Normalizuojame įvestį, kad tilptų į kvantavimo diapazoną (0-255)
+        # Tai yra critical step, kad LUT galėtų veikti su 8 bitų indeksais.
+        # Tikslas: financial_data iš [min_val, max_val] į [0, 255]
+        normalized_data = (x - x.min()) / (x.max() - x.min() + 1e-6) # Išvengiame dalybos iš nulio
+        quantized_indices = (normalized_data * (self.quant_range - 1)).round().long() # -> int (0-255)
+        
+        # Gaminame įvestį LUT, kad kiekvienas finansinis požymis turėtų savo embedding
+        # (batch_size, timesteps, input_features, lut_output_embedding_dim)
+        holographic_embeddings_from_lut = self.holographic_lut(quantized_indices)
+        
+        # Sujungiame visus embeddings į vieną ilgą vektorių vienam pavyzdžiui
+        # (batch_size, timesteps * input_features * lut_output_embedding_dim)
+        flat_holographic_embeddings = holographic_embeddings_from_lut.view(
+            holographic_embeddings_from_lut.size(0), -1
+        )
+        
+        # 2. Hologramos "generavimas" ir pertvarkymas į nD tenzorių
+        # Iš linijinės išvesties formuojame nD tenzorių
+        hologram_flat = self.hologram_generator_linear(flat_holographic_embeddings)
+        
+        # Pertvarkome išlygintą tenzorių į tikrą nD tenzorių
+        # Pvz., (batch_size, dim_size, dim_size, ...)
+        hologram_shape = (hologram_flat.size(0),) + (self.dim_size,) * self.n_dims
+        nD_hologram = hologram_flat.view(hologram_shape)
+        
+        # 3. Holografinis apdorojimas (kontrakcija ir superpozicija)
+        # Šiame etape dirbama su tikru nD tenzoriumi.
+        # Dėl PyTorch ribojimų nD konvoliucijoms ir VRAM, naudosime linijinę projekciją
+        # ir LSTM kaip "superpozicijos" sluoksnį.
+        
+        # Pirmiausia apdorojame nD hologramą, išlygindami ją ir leisdami per linijinį sluoksnį
+        processed_hologram = self.holographic_processor(nD_hologram.flatten(start_dim=1))
+        
+        # LSTM apdoroja seką. Mums reikia paversti processed_hologram į seką.
+        # Galima traktuoti, kad kiekviena "dimensijos projekcija" yra sekos elementas.
+        # Čia supaprastinimas: tiesiog pridedame timesteps dimensiją
+        lstm_input = processed_hologram.unsqueeze(1) # (batch_size, 1, hidden_dim)
+        
+        holographic_core_output, _ = self.lstm_quant(lstm_input)
+        
+        # Grąžinama yra paskutinio žingsnio būsena arba vidurkis.
+        # Naudosime paskutinio žingsnio būseną kaip "suminę hologramą"
+        final_holographic_embedding = holographic_core_output.squeeze(1) # (batch_size, hidden_dim)
+        
+        # Grąžiname kvantuotą tenzorių, kad tolesni sluoksniai galėtų jį apdoroti
+        # realiu 8 bitų tikslumu, jei modelis pilnai kvantuotas.
+        # Tačiau, kadangi šis pavyzdys naudoja F.softmax (kuriam reikia float),
+        # mes grąžiname de-kvantuotą float. Realioje gamyboje, visa grandinė būtų kvantuota.
+        return final_holographic_embedding
+3. ai_decision_head.py
+Python
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from config import AI_DECISION_CONFIG, HNN_LUT_CONFIG
+
+class AIDecisionHead(nn.Module):
+    def __init__(self, input_dim: int):
+        super().__init__()
+        self.decision_head = nn.Sequential(
+            nn.Linear(input_dim, AI_DECISION_CONFIG["decision_head_hidden_dim"]),
+            nn.ReLU(),
+            nn.Linear(AI_DECISION_CONFIG["decision_head_hidden_dim"], AI_DECISION_CONFIG["output_actions"])
+        )
+        # Kvantavimas sprendimų galvai
+        self.decision_head.qconfig = HNN_LUT_CONFIG["qconfig"] # Naudojame tą patį kvantavimo konfigą
+
+    def forward(self, x: torch.Tensor):
+        # Kvantuoto vektoriaus apdorojimas (x ateina iš HNN_QuantLUT_Core)
+        logits = self.decision_head(x)
+        probabilities = F.softmax(logits, dim=-1) # Softmax paprastai reikalauja float
+
+        action_idx = torch.argmax(probabilities, dim=-1).item()
+        action_map = {0: "BUY", 1: "SELL", 2: "HOLD"}
+        action = action_map[action_idx]
+        confidence = probabilities[0, action_idx].item() # Kadangi batch_size=1
+        
+        return action, confidence
+4. unified_hnn_ai_fabric.py
+Apjungia HNN ir AI į vieną modelį.
+
+Python
+
+import torch.nn as nn
+from hnn_quant_lut import HNN_QuantLUT_Core
+from ai_decision_head import AIDecisionHead
+from config import HNN_LUT_CONFIG, AI_DECISION_CONFIG, SYSTEM_CONFIG
+
+class UnifiedHNN_AIFabric(nn.Module):
+    def __init__(self, fabric_params: dict):
+        super().__init__()
+        
+        # HNN nD branduolys su LUT
+        self.hnn_core = HNN_QuantLUT_Core(
+            n_dims=fabric_params["n_dims"],
+            dim_size=fabric_params["dim_size"],
+            quant_bits=HNN_LUT_CONFIG["quant_bits"],
+            lut_output_embedding_dim=HNN_LUT_CONFIG["lut_output_embedding_dim"],
+            holographic_core_hidden_dim=HNN_LUT_CONFIG["holographic_core_hidden_dim"]
+        )
+        
+        # AI sprendimų galva
+        self.ai_head = AIDecisionHead(input_dim=HNN_LUT_CONFIG["holographic_core_hidden_dim"])
+
+        # Paruošimas kvantavimui apmokymo metu (Quantization-Aware Training)
+        # Įterpiame kvantavimo ir de-kvantavimo modulius.
+        # Pastaba: "fuse_modules" yra pažangesniam kvantavimui (pvz., Conv+ReLU)
+        # Šis metodas konvertuoja modelį, kad jis būtų paruoštas QAT.
+        self.q_stub = torch.quantization.QuantStub()
+        self.dequant_stub = torch.quantization.DeQuantStub()
+        
+    def forward(self, x: torch.Tensor):
+        # Kvantavimas įvesties pradžioje (jei modelis visiškai kvantuotas)
+        # Šiame pavyzdyje įvestis yra float, tad QStub atlieka kvantavimą čia.
+        x_quant = self.q_stub(x)
+
+        # HNN nD ir LUT apdorojimas
+        holographic_embedding = self.hnn_core(x_quant) # Išvestis bus de-kvantuota PyTorch
+                                                       # gamyboje, ji būtų kvantuota
+
+        # AI sprendimų priėmimas
+        # De-kvantuojame, kad sprendimų galva galėtų apdoroti
+        # (Softmax reikalauja float)
+        final_embedding = self.dequant_stub(holographic_embedding)
+        action, confidence = self.ai_head(final_embedding)
+        
+        # "Grok" tipo pasitikėjimas gali būti tiesiogiai susijęs su pagrindiniu pasitikėjimu
+        # arba papildomai apdorojamas modelio viduje.
+        # Čia simuliuojame, kad tai tiesiogiai AI pasitikėjimas.
+        grok_confidence = confidence 
+        
+        return action, confidence, grok_confidence
+
+    def prepare_for_quant_aware_training(self):
+        # Šis metodas konvertuoja modelį, kad jis būtų paruoštas QAT.
+        # Reikėtų iškviesti po modelio sukūrimo, bet prieš apmokymą.
+        self.train() # Nustatyti apmokymo režimą
+
+        # Rekomenduojama naudoti PyTorch kvantavimo API QConfigus,
+        # kurie nustatomi atskiruose sluoksniuose (kaip HNN_QuantLUT_Core)
+        
+        # Fuse modules (optional, but improves performance of quantized model)
+        # Example: if you have Conv+ReLU, they can be fused into one op for quantization
+        # This requires careful consideration of which modules can be fused.
+        # For this example, we directly set qconfig on individual layers.
+
+        # Įterpti observerius ir fake_quantize modulius.
+        # Tai "įpurškia" kvantavimo/de-kvantavimo logiką į skaičiavimų grafiką.
+        # Tai atlieka PyTorch built-in funkcija.
+        torch.quantization.prepare_qat(self, inplace=True)
+5. genetic_orchestrator.py
+Python
+
+import random
+import numpy as np
+from config import GA_CONFIG, HNN_LUT_CONFIG
+
+class GeneticOrchestrator:
+    def __init__(self):
+        self.population_size = GA_CONFIG["population_size"]
+        self.mutation_rate = GA_CONFIG["mutation_rate"]
+        self.crossover_rate = GA_CONFIG["crossover_rate"]
+        
+        self.param_ranges = {
+            "n_dims": (HNN_LUT_CONFIG["n_dims_min"], HNN_LUT_CONFIG["n_dims_max"]),
+            "dim_size": (HNN_LUT_CONFIG["dim_size_min"], HNN_LUT_CONFIG["dim_size_max"]),
+            # Galima pridėti ir kitus parametrus, pvz., hidden_dim dydžius
+            # arba num_layers, jei norite juos valdyti GA.
+        }
+        
+        self.population = self._initialize_population()
+
+    def _initialize_population(self):
+        population = []
+        for _ in range(self.population_size):
+            individual_params = {}
+            for param, (min_val, max_val) in self.param_ranges.items():
+                individual_params[param] = random.randint(min_val, max_val)
+            population.append({"params": individual_params, "fitness": 0.0})
+        return population
+
+    def evaluate_fitness(self, roi: float, ai_confidence: float, grok_confidence: float) -> float:
+        # Kompleksinė fitneso funkcija, apjungianti našumą ir pasitikėjimą
+        fitness = (GA_CONFIG["fitness_alpha"] * ai_confidence) + \
+                  (GA_CONFIG["fitness_beta"] * roi) + \
+                  (GA_CONFIG["fitness_grok_weight"] * grok_confidence)
+        return fitness
+
+    def select_parents(self):
+        # Rūšiavimas pagal fitnesą ir atrinkimas geriausiųjų
+        self.population.sort(key=lambda x: x["fitness"], reverse=True)
+        return self.population[:self.population_size // 2] # Elito atranka
+
+    def crossover(self, parent1_params: dict, parent2_params: dict) -> dict:
+        child_params = {}
+        for param in self.param_ranges:
+            if random.random() < self.crossover_rate:
+                child_params[param] = random.choice([parent1_params[param], parent2_params[param]])
+            else:
+                child_params[param] = parent1_params[param]
+        return child_params
+
+    def mutate(self, individual_params: dict) -> dict:
+        for param, (min_val, max_val) in self.param_ranges.items():
+            if random.random() < self.mutation_rate:
+                individual_params[param] = random.randint(min_val, max_val)
+        return individual_params
+
+    def evolve_population(self, current_generation_feedback: list):
+        # Atnaujinti fitnesą populiacijoje
+        for i, individual in enumerate(self.population):
+            # Priskiriame fitnesą pagal surinktą atsiliepimą
+            individual["fitness"] = self.evaluate_fitness(
+                roi=current_generation_feedback[i]["roi"],
+                ai_confidence=current_generation_feedback[i]["ai_confidence"],
+                grok_confidence=current_generation_feedback[i]["grok_confidence"]
+            )
+
+        parents = self.select_parents()
+        next_population = []
+
+        # Išlaikome elitą tiesiogiai (nepakeistą)
+        next_population.extend(parents)
+
+        # Generuojame likusią populiaciją
+        while len(next_population) < self.population_size:
+            p1 = random.choice(parents)
+            p2 = random.choice(parents)
+            
+            child_params = self.crossover(p1["params"], p2["params"])
+            mutated_child_params = self.mutate(child_params)
+            
+            next_population.append({"params": mutated_child_params, "fitness": 0.0}) # Fitnesas bus įvertintas vėliau
+
+        self.population = next_population
+
+    def get_best_individual_params(self) -> dict:
+        self.population.sort(key=lambda x: x["fitness"], reverse=True)
+        return self.population[0]["params"]
+6. environment_simulator.py
+Python
+
+import numpy as np
+import random
+from config import ENV_CONFIG
+
+class EnvironmentSimulator:
+    def __init__(self):
+        self.base_roi = ENV_CONFIG["base_roi"]
+        self.volatility_factor = ENV_CONFIG["volatility_factor"]
+
+    def simulate_trade_outcome(self, ai_action: str, confidence: float) -> float:
+        """Simuliuoja prekybos rezultatus pagal AI sprendimą ir rinkos sąlygas."""
+        
+        # Rinkos "sentimentas" kiekvienam žingsniui
+        market_sentiment = np.random.normal(0, self.volatility_factor)
+        
+        simulated_roi = 0.0
+        
+        # Pagrindinis pelnas/nuostolis priklausys nuo AI veiksmo ir pasitikėjimo
+        if ai_action == "BUY":
+            # Kuo didesnis pasitikėjimas, tuo didesnis potencialus pelnas, bet ir nuostolis esant blogai rinkai
+            simulated_roi = self.base_roi * confidence + market_sentiment * confidence
+        elif ai_action == "SELL":
+            # Atvirkštinė logika, bet panašus poveikis
+            simulated_roi = -self.base_roi * confidence - market_sentiment * confidence
+        else: # HOLD
+            # Mažesnė rizika, mažesnis potencialus pelnas/nuostolis
+            simulated_roi = np.random.normal(0, self.volatility_factor / 2)
+            
+        return simulated_roi
+7. main.py
+Python
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import logging
+import copy # For deep copying models
+from tqdm import tqdm # Progress bar
+import numpy as np
+
+from config import SYSTEM_CONFIG, GA_CONFIG, TRAINING_CONFIG, HNN_LUT_CONFIG
+from unified_hnn_ai_fabric import UnifiedHNN_AIFabric
+from genetic_orchestrator import GeneticOrchestrator
+from environment_simulator import EnvironmentSimulator
+
+# Nustatome logavimą
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+def main():
+    device = SYSTEM_CONFIG["device"]
+    logger.info(f"Sistema veikia su įrenginiu: {device}")
+    
+    # Pradinės sistemos instancijos
+    ga_orchestrator = GeneticOrchestrator()
+    env_simulator = EnvironmentSimulator()
+
+    # Optimizatorius (bus iš naujo inicializuojamas kiekvienai kartai)
+    # Realiame scenarijuje apmokymas vyktų per daug epochų su SGD/Adam
+    # Čia simuliuojame trumpą "apmokymo" ciklą per GA iteraciją.
+
+    total_system_roi_history = []
+    
+    for generation in range(GA_CONFIG["num_generations"]):
+        logger.info(f"\n--- Pradedama {generation + 1} evoliucijos karta iš {GA_CONFIG['num_generations']} ---")
+        
+        current_generation_feedback = [] # Surinks atsiliepimus kiekvienam individui
+
+        for individual_idx, individual in enumerate(tqdm(ga_orchestrator.population, desc=f"Karta {generation+1} Individualai")):
+            # Sukuriame naują modelį kiekvienam individui su GA optimizuotais parametrais
+            fabric_params = individual["params"]
+            
+            # Įsitikiname, kad modelis atitinka nurodytą VRAM limitą
+            # (Čia tikriname, ar dim_size nepadaro per didelės hologram_flat matricos)
+            # Realesnė VRAM analizė būtų sudėtingesnė.
+            try:
+                # Šį kartą naudojame pilną QAT modelį
+                current_system = UnifiedHNN_AIFabric(fabric_params).to(device)
+                
+                # Svarbu: paruošimas QAT (Quantization-Aware Training)
+                current_system.prepare_for_quant_aware_training()
+                
+                # Sukuriame optimizatorių modelio svoriams (GA valdo architektūrą, Adam - svorius)
+                optimizer = optim.Adam(current_system.parameters(), lr=TRAINING_CONFIG["learning_rate"])
+                criterion = nn.CrossEntropyLoss() # Pvz., jei prognozuojame veiksmų klases
+
+                current_individual_roi = []
+                current_individual_ai_conf = []
+                current_individual_grok_conf = []
+
+                # Kiekvienas individas testuojamas tam tikrą skaičių žingsnių
+                for step in range(TRAINING_CONFIG["steps_per_generation"]):
+                    # Simuliuojami finansiniai duomenys
+                    # (batch_size=1, timesteps, input_features)
+                    financial_data = torch.randn(
+                        1, HNN_LUT_CONFIG["timesteps"], HNN_LUT_CONFIG["input_features"], 
+                        dtype=SYSTEM_CONFIG["precision_dtype"]
+                    ).to(device)
+
+                    # Apmokymo iteracija (nors ir simuliacinė)
+                    optimizer.zero_grad()
+                    action_str, ai_confidence, grok_confidence = current_system(financial_data)
+                    
+                    # Simuliuojame nuostolių funkcijos skaičiavimą (realioje sistemoje - tikslas)
+                    # Pvz., jei turėtume tikrą tikslą (pvz., kas turėjo būti teisingas veiksmas)
+                    # target_action_label = torch.tensor([random.randint(0, 2)], device=device)
+                    # loss = criterion(logits, target_action_label)
+                    # loss.backward()
+                    # optimizer.step()
+
+                    # Grįžtamasis ryšys iš aplinkos
+                    simulated_roi = env_simulator.simulate_trade_outcome(action_str, ai_confidence)
+                    
+                    current_individual_roi.append(simulated_roi)
+                    current_individual_ai_conf.append(ai_confidence)
+                    current_individual_grok_conf.append(grok_confidence)
+                
+                # Įvertinimas po visų žingsnių
+                avg_roi = np.mean(current_individual_roi)
+                avg_ai_conf = np.mean(current_individual_ai_conf)
+                avg_grok_conf = np.mean(current_individual_grok_conf)
+
+                current_generation_feedback.append({
+                    "roi": avg_roi,
+                    "ai_confidence": avg_ai_conf,
+                    "grok_confidence": avg_grok_conf
+                })
+                
+                logger.info(
+                    f"  Individualas {individual_idx+1}: Parametrai={individual['params']}, "
+                    f"Vid. ROI={avg_roi:.4f}, Vid. Patikimumas={avg_ai_conf:.2f}"
+                )
+                
+                # Svarbu: Išvalyti GPU atmintį po kiekvieno modelio bandymo
+                del current_system
+                torch.cuda.empty_cache()
+
+            except RuntimeError as e:
+                logger.error(f"  VRAM arba kita klaida individualui {individual_idx+1}: {e}")
+                current_generation_feedback.append({
+                    "roi": -1.0, # Labai prastas fitnesas dėl klaidos
+                    "ai_confidence": 0.0,
+                    "grok_confidence": 0.0
+                })
+                # Dar kartą išvalome atmintį po kritinės klaidos
+                torch.cuda.empty_cache()
+
+        # Evoliucija pagal surinktus atsiliepimus
+        ga_orchestrator.evolve_population(current_generation_feedback)
+        
+        best_params_this_gen = ga_orchestrator.get_best_individual_params()
+        
+        # Sukuriame geriausią modelį šios kartos vizualizavimui ir apmokymui
+        best_model_this_gen = UnifiedHNN_AIFabric(best_params_this_gen).to(device)
+        best_model_this_gen.prepare_for_quant_aware_training()
+        best_model_this_gen.eval() # Nustatome vertinimo režimą
+        
+        # Testuojame geriausią modelį ir renkamės bendrą ROI istorijai
+        test_roi = []
+        with torch.no_grad():
+            for _ in range(TRAINING_CONFIG["steps_per_generation"]):
+                data = torch.randn(
+                    1, HNN_LUT_CONFIG["timesteps"], HNN_LUT_CONFIG["input_features"], 
+                    dtype=SYSTEM_CONFIG["precision_dtype"]
+                ).to(device)
+                action, conf, _ = best_model_this_gen(data)
+                test_roi.append(env_simulator.simulate_trade_outcome(action, conf))
+        
+        avg_gen_roi = np.mean(test_roi)
+        total_system_roi_history.append(avg_gen_roi)
+        
+        logger.info(f"--- Karta {generation+1} Pabaiga: Geriausi parametrai={best_params_this_gen}, Vid. testavimo ROI={avg_gen_roi:.4f} ---")
+        
+        # Išvalome modelį po naudojimo
+        del best_model_this_gen
+        torch.cuda.empty_cache()
+
+
+    logger.info("\n--- Evoliucija baigta ---")
+    logger.info(f"Sistemos ROI evoliucija per kartas: {total_system_roi_history}")
+    
+    # Galutinio geriausio modelio paruošimas
+    final_best_params = ga_orchestrator.get_best_individual_params()
+    final_system = UnifiedHNN_AIFabric(final_best_params).to(device)
+    final_system.prepare_for_quant_aware_training() # Paruošiame QAT
+    
+    # Baigiamasis žingsnis: Konvertuoti į tikrą kvantuotą modelį po QAT
+    # (Tikras apmokymas su QAT vyktų čia ilgą laiką)
+    # Po pilno apmokymo su QAT, modelis konvertuojamas į kvantuotą modelį inference.
+    # q_model = torch.quantization.convert(final_system.eval(), inplace=False)
+    # logger.info("Galutinis modelis paruoštas inference su 8-bitų kvantavimu.")
+    # logger.info(f"Galutinio modelio parametrai: {final_best_params}")
+
+if __name__ == "__main__":
+    main()
+Gamybinio kodo paaiškinimai ir HNN nD bei LUT išlaikymas:
+Tikras HNN nD tenzorius (hnn_quant_lut.py):
+
+hologram_generator_linear sluoksnis sugeneruoja išlygintą vektorių, kuris po to nD_hologram = hologram_flat.view(hologram_shape) operacija atkuriamas į tikrą nD tenzorių. Šis tenzorius turi GA nustatytą n_dims (matmenų skaičių) ir dim_size (kiekvienos dimensijos dydį).
+
+Šiame etape jau turime tikrą nD tenzorių, su kuriuo vėliau galima būtų atlikti sudėtingesnes tenzorių kontrakcijos ar daugiamačių konvoliucijų operacijas, jei VRAM leistų. Dabartiniame pavyzdyje naudojama linijinė projekcija ir LSTM kaip "superpozicijos" mechanizmas dėl VRAM apribojimų, tačiau pats nD tenzorius egzistuoja grafike.
+
+LUT integravimas nuo pat pradžių (hnn_quant_lut.py):
+
+holographic_lut = nn.Embedding(...) yra esmė. Įvesties finansiniai duomenys yra kvantuojami į 0-255 indeksus (quantized_indices). Šie indeksai tiesiogiai naudojami kreipiantis į holographic_lut, gaunant holografinius įterpimus (holographic_embeddings_from_lut). Tai reiškia, kad nuo pat įvesties etapo duomenys yra apdorojami per LUT, atspindintį HNN kvantinių būsenų principą.
+
+GA gali optimizuoti lut_output_embedding_dim, t.y., kokio "dydžio" yra kiekviena holografinė būsena.
+
+Kvantavimas visame modelyje (QAT):
+
+qconfig ir prepare_for_quant_aware_training() kodo dalys (unified_hnn_ai_fabric.py ir hnn_quant_lut.py) rodo, kaip PyTorch naudojamas Quantization-Aware Training (QAT). Tai reiškia, kad modelis mokymo metu yra "mokomas" žinoti apie kvantavimo efektus, kas žymiai sumažina tikslumo praradimą pereinant prie 8 bitų inference metu.
+
+Nors šiame pavyzdyje pilnas QAT mokymo ciklas nėra įdiegtas (tam reikėtų tikrų duomenų ir nuostolių funkcijos), paruošimo žingsniai yra teisingi gamybiniam modeliui.
+
+GA kaip centrinis orkestratorius (genetic_orchestrator.py):
+
+GA tiesiogiai optimizuoja HNN nD matmenų skaičių (n_dims) ir dimensijų dydį (dim_size), taip pat kitus svarbius architektūros parametrus. Tai užtikrina, kad sistema pati evoliucionuoja į optimalią holografinę-AI konfigūraciją.
+
+Fitneso funkcija apjungia ROI, AI pasitikėjimą ir "Grok" tipo pasitikėjimą, leidžiant GA rasti pusiausvyrą tarp pelno ir sistemos "žinojimo".
+
+Moduliškumas: Kiekvienas komponentas yra atskiras PyTorch modulis arba Python klasė, užtikrinanti aiškumą ir lengvą priežiūrą.

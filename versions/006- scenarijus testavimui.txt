@@ -1,0 +1,355 @@
+import torch
+import random
+import copy
+from typing import Dict, Any, List, Tuple
+
+# Originalūs konfigūracijos žodynai iš jūsų kodo
+HNN_LUT_CONFIG_EXAMPLE = {
+    "quant_bits": 4,  # Mažiname dėl testavimo
+    "lut_output_embedding_dim": 8,
+    "n_dims_min": 2,
+    "n_dims_max": 3,
+    "dim_size_min": 2,
+    "dim_size_max": 3,
+}
+
+SYSTEM_CONFIG_EXAMPLE = {
+    "device": "cpu",  # Naudojame CPU dėl testavimo paprastumo
+    "precision_dtype": torch.float32,
+}
+
+CONSILIUUM_CONFIG_EXAMPLE = {
+    "head_base_filter_dim": 4,
+    "synthesis_mlp_units": [16, 8],
+    "num_hologram_iterations": 2,
+    "alpha_update_rate": 0.05,
+    "einsum_schemes": {
+        "analysis_pattern": "b...ijk,fijk->bf",
+        "synthesis_pattern": "b...,s...->bs...",
+        "validation_pattern": "b...ijk,vijk->bv"
+    },
+    "grok_weights": {
+        "entropy_reduction": 0.5,
+        "inter_head_coherence": 0.3,
+        "decision_confidence": 0.2
+    }
+}
+
+GA_CONFIG = {
+    "population_size": 5,  # Mažiname dėl greičio
+    "num_generations": 3,
+    "mutation_rate": 0.2,
+    "crossover_rate": 0.8,
+    "selection_method": "tournament",
+    "tournament_size": 2,
+    "elitism_count": 1,
+    "einsum_scheme_options": {
+        "analysis": ["b...ijk,fijk->bf"],
+        "synthesis": ["b...,s...->bs..."],
+        "validation": ["b...ijk,vijk->bv"]
+    }
+}
+
+# CoreHologram klasė (perkelta iš jūsų kodo, supaprastinta)
+class CoreHologram(torch.nn.Module):
+    def __init__(self, n_dims: int, dim_size: int, quant_bits: int, lut_output_embedding_dim: int):
+        super().__init__()
+        if not (HNN_LUT_CONFIG_EXAMPLE["n_dims_min"] <= n_dims <= HNN_LUT_CONFIG_EXAMPLE["n_dims_max"] and
+                HNN_LUT_CONFIG_EXAMPLE["dim_size_min"] <= dim_size <= HNN_LUT_CONFIG_EXAMPLE["dim_size_max"]):
+            raise ValueError(f"Invalid n_dims ({n_dims}) or dim_size ({dim_size}).")
+        
+        self.n_dims = n_dims
+        self.dim_size = dim_size
+        self.quant_range = 2**quant_bits
+        self.lut_output_embedding_dim = lut_output_embedding_dim
+        
+        self.holographic_lut = torch.nn.Embedding(self.quant_range, self.lut_output_embedding_dim).to(SYSTEM_CONFIG_EXAMPLE["device"], dtype=SYSTEM_CONFIG_EXAMPLE["precision_dtype"])
+        total_hologram_volume = self.dim_size ** self.n_dims
+        self.initial_hologram_projector = torch.nn.Linear(self.lut_output_embedding_dim, total_hologram_volume).to(SYSTEM_CONFIG_EXAMPLE["device"], dtype=SYSTEM_CONFIG_EXAMPLE["precision_dtype"])
+        self._current_hologram = None
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        min_val = x.min(dim=-1, keepdim=True)[0].min(dim=-2, keepdim=True)[0]
+        max_val = x.max(dim=-1, keepdim=True)[0].max(dim=-2, keepdim=True)[0]
+        normalized_data = (x - min_val) / (max_val - min_val + 1e-6)
+        quantized_indices = (normalized_data * (self.quant_range - 1)).round().long()
+        
+        holographic_embeddings_from_lut = self.holographic_lut(quantized_indices)
+        reshape_for_projection = holographic_embeddings_from_lut.view(holographic_embeddings_from_lut.size(0), -1, self.lut_output_embedding_dim)
+        holographic_projection_parts = self.initial_hologram_projector(reshape_for_projection)
+        initial_nD_hologram_flat = torch.mean(holographic_projection_parts, dim=1)
+        hologram_shape = (initial_nD_hologram_flat.size(0),) + (self.dim_size,) * self.n_dims
+        self._current_hologram = initial_nD_hologram_flat.view(hologram_shape)
+        return self._current_hologram
+    
+    def update_hologram(self, delta_hologram: torch.Tensor):
+        if self._current_hologram is None:
+            raise RuntimeError("Hologram not initialized.")
+        if delta_hologram.shape != self._current_hologram.shape:
+            raise ValueError(f"Delta hologram shape {delta_hologram.shape} does not match {self._current_hologram.shape}")
+        self._current_hologram = self._current_hologram + delta_hologram
+    
+    def get_hologram(self) -> torch.Tensor:
+        if self._current_hologram is None:
+            raise RuntimeError("Hologram not initialized.")
+        return self._current_hologram
+
+# HolographicAI_Consilium klasė (supaprastinta)
+class HolographicAI_Consilium(torch.nn.Module):
+    def __init__(self, core_hologram_instance: CoreHologram):
+        super().__init__()
+        self.core_hologram = core_hologram_instance
+        self.n_dims = self.core_hologram.n_dims
+        self.dim_size = self.core_hologram.dim_size
+        self.device = SYSTEM_CONFIG_EXAMPLE["device"]
+        self.precision_dtype = SYSTEM_CONFIG_EXAMPLE["precision_dtype"]
+        
+        self.consilium_filters = torch.nn.Parameter(
+            torch.randn(3 * CONSILIUUM_CONFIG_EXAMPLE["head_base_filter_dim"], *(self.dim_size for _ in range(self.n_dims))
+            ).to(self.device, dtype=self.precision_dtype)
+        )
+        self.analysis_filter_slice = slice(0, CONSILIUUM_CONFIG_EXAMPLE["head_base_filter_dim"])
+        self.synthesis_filter_slice = slice(CONSILIUUM_CONFIG_EXAMPLE["head_base_filter_dim"], 2 * CONSILIUUM_CONFIG_EXAMPLE["head_base_filter_dim"])
+        self.validation_filter_slice = slice(2 * CONSILIUUM_CONFIG_EXAMPLE["head_base_filter_dim"], 3 * CONSILIUUM_CONFIG_EXAMPLE["head_base_filter_dim"])
+        
+        self.analysis_projection_layer = torch.nn.Linear(
+            CONSILIUUM_CONFIG_EXAMPLE["head_base_filter_dim"], CONSILIUUM_CONFIG_EXAMPLE["head_base_filter_dim"]
+        ).to(self.device, dtype=self.precision_dtype)
+        
+        synthesis_input_size = CONSILIUUM_CONFIG_EXAMPLE["head_base_filter_dim"]
+        synthesis_layers = []
+        for units in CONSILIUUM_CONFIG_EXAMPLE["synthesis_mlp_units"]:
+            synthesis_layers.append(torch.nn.Linear(synthesis_input_size, units))
+            synthesis_layers.append(torch.nn.ReLU())
+            synthesis_input_size = units
+        total_hologram_volume = self.dim_size ** self.n_dims
+        synthesis_layers.append(torch.nn.Linear(synthesis_input_size, total_hologram_volume))
+        self.synthesis_mlp = torch.nn.Sequential(*synthesis_layers).to(self.device, dtype=self.precision_dtype)
+        
+        self.alpha_update = torch.nn.Parameter(torch.tensor(CONSILIUUM_CONFIG_EXAMPLE["alpha_update_rate"], dtype=self.precision_dtype, device=self.device))
+        self.final_decision_layer = torch.nn.Linear(CONSILIUUM_CONFIG_EXAMPLE["head_base_filter_dim"], 3).to(self.device, dtype=self.precision_dtype)
+    
+    def forward(self) -> (torch.Tensor, dict):
+        current_hologram = self.core_hologram.get_hologram()
+        batch_size = current_hologram.size(0)
+        hologram_history = [current_hologram.clone()]
+        analysis_output_history = []
+        iter_grok_metrics = []
+        
+        for i in range(CONSILIUUM_CONFIG_EXAMPLE["num_hologram_iterations"]):
+            analysis_filters_for_iter = self.consilium_filters[self.analysis_filter_slice]
+            hologram_indices = ''.join(chr(ord('j') + k) for k in range(self.n_dims))
+            einsum_formula_analysis = f"b{hologram_indices},{'f' + hologram_indices}->bf"
+            analysis_output_raw = torch.einsum(einsum_formula_analysis, current_hologram, analysis_filters_for_iter)
+            analysis_output = self.analysis_projection_layer(analysis_output_raw)
+            analysis_output_history.append(analysis_output)
+            
+            synthesis_flat_delta = self.synthesis_mlp(analysis_output)
+            delta_hologram_shape = (batch_size,) + (self.dim_size,) * self.n_dims
+            delta_hologram = synthesis_flat_delta.view(delta_hologram_shape)
+            self.core_hologram.update_hologram(delta_hologram * self.alpha_update)
+            current_hologram = self.core_hologram.get_hologram()
+            hologram_history.append(current_hologram.clone())
+            
+            validation_filters_for_iter = self.consilium_filters[self.validation_filter_slice]
+            einsum_formula_validation = f"b{hologram_indices},{'v' + hologram_indices}->bv"
+            validation_output_raw = torch.einsum(einsum_formula_validation, current_hologram, validation_filters_for_iter)
+            final_logits = self.final_decision_layer(validation_output_raw)
+            
+            initial_entropy_proxy = -torch.mean(hologram_history[0].abs() * torch.log(hologram_history[0].abs() + 1e-6))
+            current_entropy_proxy = -torch.mean(current_hologram.abs() * torch.log(current_hologram.abs() + 1e-6))
+            entropy_reduction_score = (initial_entropy_proxy - current_entropy_proxy).mean().item()
+            
+            inter_head_coherence_score = 0.0
+            if len(analysis_output_history) > 1:
+                analysis_vec = torch.nn.functional.normalize(analysis_output_history[-1].mean(dim=0), p=2, dim=0)
+                validation_vec = torch.nn.functional.normalize(validation_output_raw.mean(dim=0), p=2, dim=0)
+                inter_head_coherence_score = torch.nn.functional.cosine_similarity(analysis_vec, validation_vec, dim=0).item()
+            
+            decision_confidence_score = torch.max(torch.nn.functional.softmax(final_logits, dim=-1), dim=-1)[0].mean().item()
+            overall_grok_score = (
+                CONSILIUUM_CONFIG_EXAMPLE["grok_weights"]["entropy_reduction"] * entropy_reduction_score +
+                CONSILIUUM_CONFIG_EXAMPLE["grok_weights"]["inter_head_coherence"] * inter_head_coherence_score +
+                CONSILIUUM_CONFIG_EXAMPLE["grok_weights"]["decision_confidence"] * decision_confidence_score
+            )
+            iter_grok_metrics.append({
+                f'iter_{i}_entropy_reduction': entropy_reduction_score,
+                f'iter_{i}_inter_head_coherence': inter_head_coherence_score,
+                f'iter_{i}_decision_confidence': decision_confidence_score,
+                f'iter_{i}_overall_grok': overall_grok_score
+            })
+        
+        return final_logits, iter_grok_metrics
+
+# GeneticArchitect klasė (supaprastinta)
+class GeneticArchitect:
+    def __init__(self, data_feed: Any, target_metric_func: callable):
+        self.data_feed = data_feed
+        self.target_metric_func = target_metric_func
+        self.population: List[Dict[str, Any]] = []
+        self.best_individual: Dict[str, Any] = None
+    
+    def _generate_random_genome(self) -> Dict[str, Any]:
+        genome = {
+            "n_dims": random.randint(HNN_LUT_CONFIG_EXAMPLE["n_dims_min"], HNN_LUT_CONFIG_EXAMPLE["n_dims_max"]),
+            "dim_size": random.randint(HNN_LUT_CONFIG_EXAMPLE["dim_size_min"], HNN_LUT_CONFIG_EXAMPLE["dim_size_max"]),
+            "quant_bits": random.choice([4, 8]),
+            "lut_output_embedding_dim": random.randint(4, 16),
+            "head_base_filter_dim": random.randint(4, 8),
+            "synthesis_mlp_units": random.sample([[16, 8], [8, 4]], 1)[0],
+            "num_hologram_iterations": random.randint(1, 3),
+            "alpha_update_rate": random.uniform(0.01, 0.1),
+            "einsum_scheme_analysis": random.choice(GA_CONFIG["einsum_scheme_options"]["analysis"]),
+            "einsum_scheme_synthesis": random.choice(GA_CONFIG["einsum_scheme_options"]["synthesis"]),
+            "einsum_scheme_validation": random.choice(GA_CONFIG["einsum_scheme_options"]["validation"]),
+            "grok_weights": {
+                "entropy_reduction": random.uniform(0.1, 1.0),
+                "inter_head_coherence": random.uniform(0.1, 1.0),
+                "decision_confidence": random.uniform(0.1, 1.0)
+            }
+        }
+        total = sum(genome["grok_weights"].values())
+        genome["grok_weights"] = {k: v / total for k, v in genome["grok_weights"].items()}
+        return genome
+    
+    def _evaluate_fitness(self, genome: Dict[str, Any]) -> float:
+        try:
+            core_hologram = CoreHologram(
+                n_dims=genome["n_dims"], dim_size=genome["dim_size"],
+                quant_bits=genome["quant_bits"], lut_output_embedding_dim=genome["lut_output_embedding_dim"]
+            )
+            global CONSILIUUM_CONFIG_EXAMPLE
+            CONSILIUUM_CONFIG_EXAMPLE["head_base_filter_dim"] = genome["head_base_filter_dim"]
+            CONSILIUUM_CONFIG_EXAMPLE["synthesis_mlp_units"] = genome["synthesis_mlp_units"]
+            CONSILIUUM_CONFIG_EXAMPLE["num_hologram_iterations"] = genome["num_hologram_iterations"]
+            CONSILIUUM_CONFIG_EXAMPLE["alpha_update_rate"] = genome["alpha_update_rate"]
+            CONSILIUUM_CONFIG_EXAMPLE["einsum_schemes"]["analysis_pattern"] = genome["einsum_scheme_analysis"]
+            CONSILIUUM_CONFIG_EXAMPLE["einsum_schemes"]["synthesis_pattern"] = genome["einsum_scheme_synthesis"]
+            CONSILIUUM_CONFIG_EXAMPLE["einsum_schemes"]["validation_pattern"] = genome["einsum_scheme_validation"]
+            CONSILIUUM_CONFIG_EXAMPLE["grok_weights"] = genome["grok_weights"]
+            
+            consilium = HolographicAI_Consilium(core_hologram_instance=core_hologram)
+            mock_input_data = self.data_feed.get_data()
+            initial_hologram = core_hologram(mock_input_data)
+            final_logits, grok_metrics_history = consilium()
+            
+            mock_targets = torch.randint(0, 3, (final_logits.size(0),)).to(SYSTEM_CONFIG_EXAMPLE["device"])
+            simulated_roi = self.target_metric_func(final_logits, mock_targets)
+            overall_grok_score = grok_metrics_history[-1][f'iter_{CONSILIUUM_CONFIG_EXAMPLE["num_hologram_iterations"]-1}_overall_grok'] if grok_metrics_history else 0.0
+            fitness = (simulated_roi * 0.7) + (overall_grok_score * 0.3)
+            return fitness
+        except Exception as e:
+            print(f"Error evaluating genome: {e}")
+            return -1.0
+    
+    def _selection(self) -> Dict[str, Any]:
+        tournament_members = random.sample(self.population, GA_CONFIG["tournament_size"])
+        return max(tournament_members, key=lambda x: x["fitness"])["genome"]
+    
+    def _crossover(self, parent1: Dict[str, Any], parent2: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        child1 = copy.deepcopy(parent1)
+        child2 = copy.deepcopy(parent2)
+        genome_keys = list(parent1.keys())
+        crossover_point = random.randint(1, len(genome_keys) - 1)
+        for i in range(crossover_point):
+            key = genome_keys[i]
+            child1[key], child2[key] = parent2[key], parent1[key]
+        child1["grok_weights"] = normalize_grok_weights(child1["grok_weights"])
+        child2["grok_weights"] = normalize_grok_weights(child2["grok_weights"])
+        return child1, child2
+    
+    def _mutate(self, genome: Dict[str, Any]) -> Dict[str, Any]:
+        mutated_genome = copy.deepcopy(genome)
+        if random.random() < GA_CONFIG["mutation_rate"]:
+            mutated_genome["n_dims"] = random.randint(HNN_LUT_CONFIG_EXAMPLE["n_dims_min"], HNN_LUT_CONFIG_EXAMPLE["n_dims_max"])
+        if random.random() < GA_CONFIG["mutation_rate"]:
+            mutated_genome["dim_size"] = random.randint(HNN_LUT_CONFIG_EXAMPLE["dim_size_min"], HNN_LUT_CONFIG_EXAMPLE["dim_size_max"])
+        if random.random() < GA_CONFIG["mutation_rate"]:
+            mutated_genome["quant_bits"] = random.choice([4, 8])
+        if random.random() < GA_CONFIG["mutation_rate"]:
+            mutated_genome["lut_output_embedding_dim"] = random.randint(4, 16)
+        if random.random() < GA_CONFIG["mutation_rate"]:
+            mutated_genome["head_base_filter_dim"] = random.randint(4, 8)
+        if random.random() < GA_CONFIG["mutation_rate"]:
+            mutated_genome["synthesis_mlp_units"] = random.sample([[16, 8], [8, 4]], 1)[0]
+        if random.random() < GA_CONFIG["mutation_rate"]:
+            mutated_genome["num_hologram_iterations"] = random.randint(1, 3)
+        if random.random() < GA_CONFIG["mutation_rate"]:
+            mutated_genome["alpha_update_rate"] = random.uniform(0.01, 0.1)
+        if random.random() < GA_CONFIG["mutation_rate"]:
+            for key in mutated_genome["grok_weights"].keys():
+                mutated_genome["grok_weights"][key] = random.uniform(0.01, 1.0)
+            mutated_genome["grok_weights"] = normalize_grok_weights(mutated_genome["grok_weights"])
+        return mutated_genome
+    
+    def run_evolution(self):
+        print("Inicijuojama pradinė populiacija...")
+        self.population = [{"genome": self._generate_random_genome(), "fitness": -1.0} for _ in range(GA_CONFIG["population_size"])]
+        for ind in self.population:
+            ind["fitness"] = self._evaluate_fitness(ind["genome"])
+        self.population.sort(key=lambda x: x["fitness"], reverse=True)
+        self.best_individual = self.population[0]
+        print(f"Pradinės populiacijos geriausias fitness: {self.best_individual['fitness']:.4f}")
+        
+        for generation in range(GA_CONFIG["num_generations"]):
+            print(f"\n--- Karta {generation + 1}/{GA_CONFIG['num_generations']} ---")
+            new_population = [self.population[i] for i in range(GA_CONFIG["elitism_count"])]
+            while len(new_population) < GA_CONFIG["population_size"]:
+                parent1_genome = self._selection()
+                parent2_genome = self._selection()
+                if random.random() < GA_CONFIG["crossover_rate"]:
+                    child1_genome, child2_genome = self._crossover(parent1_genome, parent2_genome)
+                else:
+                    child1_genome, child2_genome = parent1_genome, parent2_genome
+                child1_genome = self._mutate(child1_genome)
+                child2_genome = self._mutate(child2_genome)
+                new_population.append({"genome": child1_genome, "fitness": self._evaluate_fitness(child1_genome)})
+                if len(new_population) < GA_CONFIG["population_size"]:
+                    new_population.append({"genome": child2_genome, "fitness": self._evaluate_fitness(child2_genome)})
+            self.population = sorted(new_population, key=lambda x: x["fitness"], reverse=True)
+            if self.population[0]["fitness"] > self.best_individual["fitness"]:
+                self.best_individual = self.population[0]
+            print(f"Geriausias kartos fitness: {self.population[0]['fitness']:.4f}")
+            print(f"Bendras geriausias fitness: {self.best_individual['fitness']:.4f}")
+        
+        return self.best_individual["genome"]
+
+def normalize_grok_weights(weights):
+    total = sum(weights.values())
+    return {k: v / total for k, v in weights.items()}
+
+# Mock duomenys ir metrika
+class MockDataFeed:
+    def get_data(self):
+        return torch.randn(2, 3, 5).to(SYSTEM_CONFIG_EXAMPLE["device"])  # (batch_size=2, timesteps=3, input_features=5)
+
+def mock_target_metric(predictions: torch.Tensor, targets: torch.Tensor) -> float:
+    accuracy = (predictions.argmax(dim=-1) == targets).float().mean().item()
+    return accuracy * random.uniform(0.5, 1.5)
+
+# Testavimo vykdymas
+if __name__ == "__main__":
+    data_feed = MockDataFeed()
+    architect = GeneticArchitect(data_feed=data_feed, target_metric_func=mock_target_metric)
+    optimal_genome = architect.run_evolution()
+    print("\nOptimalus genomas:", optimal_genome)
+    
+    # Sukuriame galutinę sistemą su optimaliu genomu
+    final_core_hologram = CoreHologram(
+        n_dims=optimal_genome["n_dims"],
+        dim_size=optimal_genome["dim_size"],
+        quant_bits=optimal_genome["quant_bits"],
+        lut_output_embedding_dim=optimal_genome["lut_output_embedding_dim"]
+    )
+    CONSILIUUM_CONFIG_EXAMPLE["head_base_filter_dim"] = optimal_genome["head_base_filter_dim"]
+    CONSILIUUM_CONFIG_EXAMPLE["synthesis_mlp_units"] = optimal_genome["synthesis_mlp_units"]
+    CONSILIUUM_CONFIG_EXAMPLE["num_hologram_iterations"] = optimal_genome["num_hologram_iterations"]
+    CONSILIUUM_CONFIG_EXAMPLE["alpha_update_rate"] = optimal_genome["alpha_update_rate"]
+    CONSILIUUM_CONFIG_EXAMPLE["grok_weights"] = optimal_genome["grok_weights"]
+    
+    final_consilium = HolographicAI_Consilium(core_hologram_instance=final_core_hologram)
+    test_data = data_feed.get_data()
+    final_core_hologram(test_data)
+    final_decision, final_grok_metrics = final_consilium()
+    print(f"\nGalutinis sprendimas (logits): {final_decision}")
+    print(f"Galutinės GROK metrikos: {final_grok_metrics[-1] if final_grok_metrics else 'N/A'}")

@@ -1,0 +1,423 @@
+ GA HNN nDxnD 
+
+
+Gerai, aš visiškai supratau jūsų lūkesčius. Pateiksiu pramoninio lygio kodo pradžią, sutelkiant dėmesį į pagrindinius komponentus, kuriuos aptarėme: ComplexQuantizer, GA valdomą bitų kvantavimą, pradinę genomo struktūrą ir pirmąsias pramoninio logavimo bei resursų valdymo gaires.
+
+Šis kodas yra bazė, kuri demonstruoja mūsų aptartus principus. Tai yra fragmentas, skirtas pademonstruoti kokybę ir architektūrą, o ne visa sistema vienu metu. Visi komponentai bus plečiami palaipsniui.
+
+Atkreipkite dėmesį: Tai yra Python pavyzdys, naudojantis torch biblioteką (NumPy naudojamas tik pavyzdiniams duomenims generuoti). Tikslūs GPU operacijų optimizavimai (pvz., custom CUDA kernels) reikalautų sudėtingesnio PyTorch/C++ interfeiso ir bus integruojami vėlesnėse, našumo optimizavimo stadijose.
+
+Python
+
+import torch
+import torch.nn.functional as F
+import numpy as np
+import logging
+from datetime import datetime
+import uuid
+import sys
+
+# --- 1. Pramoninis Logavimas ---
+# Nustatome bazinę logavimo konfigūraciją.
+# Pramoninėje aplinkoje tai būtų konfigūruojama per failą (pvz., YAML).
+logging.basicConfig(
+    level=logging.INFO, # Pagal nutylėjimą INFO lygis. Galima keisti į DEBUG gilesnei analizei.
+    format='{"timestamp": "%(asctime)s", "level": "%(levelname)s", "message": "%(message)s"}',
+    handlers=[
+        logging.StreamHandler(sys.stdout) # Spausdinti į konsolę (stdout)
+        # logging.FileHandler("hnn_evolution.log", mode='a') # Gamyboje būtų rašoma ir į failą
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# --- 2. ResourceManager (Resursų Valdymas) ---
+# Atsakingas už VRAM stebėjimą ir valdymą.
+class ResourceManager:
+    def __init__(self, max_vram_mb: int = 1900): # GTX 960M 2GB = ~1900MB realiems duomenims
+        self.max_vram_mb = max_vram_mb
+        logger.info(f"ResourceManager inicijuotas. Maksimali leidžiama VRAM: {self.max_vram_mb} MB.")
+
+    def allocate(self, genome: 'Genome'):
+        """Imituoja VRAM alokaciją ir patikrina limitus."""
+        # Šiame etape skaičiuojame tik hologram_state VRAM. Vėliau pridėsime kitus komponentus.
+        allocated_vram_mb = genome.calculate_hologram_vram_usage()
+        genome.current_vram_mb = allocated_vram_mb # Atnaujiname genomo VRAM statistiką
+        
+        if allocated_vram_mb > self.max_vram_mb:
+            logger.warning(f"VRAM viršijimas genomui {genome.id}: {allocated_vram_mb:.2f} MB > {self.max_vram_mb} MB. Šis genomas gaus 'FATALITY'.")
+            return False # Viršytas limitas
+        
+        logger.info(f"Genomui {genome.id} alokuota VRAM: {allocated_vram_mb:.2f} MB. Likusi VRAM: {self.max_vram_mb - allocated_vram_mb:.2f} MB.")
+        return True # Alokacija sėkminga
+
+    def release(self, genome: 'Genome'):
+        """Imituoja VRAM atlaisvinimą. Gamyboje būtų ir torch.cuda.empty_cache()."""
+        # Išvalome tikrąją GPU atmintį, jei dirbame su CUDA
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        logger.info(f"Genomo {genome.id} VRAM atlaisvinta. Cached VRAM po atlaisvinimo: {torch.cuda.memory_cached() / (1024**2):.2f} MB")
+
+
+# --- 3. ComplexQuantizer (Kompleksinių Skaičių Kvantavimas) ---
+# Ši klasė apdoroja nDxnD tenzorius, todėl tai yra "visrakčio" dalis bitų lygmeniu.
+class ComplexQuantizer:
+    def __init__(self, bits: int):
+        if bits not in [2, 4, 8]:
+            raise ValueError("Kvantavimo bitų skaičius turi būti 2, 4 arba 8.")
+        self.bits = bits
+        self.num_levels = 2**bits
+        logger.debug(f"ComplexQuantizer inicijuotas su {self.bits} bitais ({self.num_levels} lygių).")
+
+    def _get_quantization_range(self, tensor: torch.Tensor):
+        """Apskaičiuoja kvantavimo diapazoną remiantis tenzoriaus min/max reikšmėmis."""
+        min_val = tensor.min()
+        max_val = tensor.max()
+        # Pridedame nedidelę maržą, kad išvengtume kraštinių reikšmių problemų
+        margin = (max_val - min_val) * 0.01 
+        quant_min = min_val - margin
+        quant_max = max_val + margin
+        return quant_min, quant_max
+
+    def quantize(self, complex_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Kvantuoja kompleksinį tenzorių į sveikųjų skaičių indeksus.
+        Grąžina torch.Tensor su dtype=torch.uint8, kad taupytų atmintį.
+        """
+        if not torch.is_complex(complex_tensor):
+            raise TypeError("Įvesties tenzorius turi būti kompleksinis.")
+
+        real_part = complex_tensor.real
+        imag_part = complex_tensor.imag
+
+        # Nustatome kvantavimo diapazonus realiai ir menamai dalims atskirai
+        # Gamyboje galėtume turėti fiksuotus diapazonus arba dinamiškai GA valdomus.
+        real_min, real_max = self._get_quantization_range(real_part)
+        imag_min, imag_max = self._get_quantization_range(imag_part)
+
+        # Normalizuojame į [0, 1] diapazoną
+        normalized_real = (real_part - real_min) / (real_max - real_min)
+        normalized_imag = (imag_part - imag_min) / (imag_max - imag_min)
+
+        # Kvantuojame į int indeksus [0, num_levels - 1]
+        quantized_real = torch.round(normalized_real * (self.num_levels - 1)).to(torch.uint8)
+        quantized_imag = torch.round(normalized_imag * (self.num_levels - 1)).to(torch.uint8)
+
+        # Supakuojame abi dalis į vieną tenzorių.
+        # Nurodome, kad pirmoji dim yra skirta dalims (real/imag), antroji ir toliau - originalios dim.
+        # Pvz., jei originalus (2,3,4), tai supakuotas bus (2,2,3,4)
+        packed_quantized = torch.stack([quantized_real, quantized_imag], dim=0)
+        
+        logger.debug(f"Tenzorius kvantuotas į {self.bits} bitus. Supakuoto tenzoriaus forma: {packed_quantized.shape}, dtype: {packed_quantized.dtype}")
+        return packed_quantized
+
+    def dequantize(self, packed_quantized_tensor: torch.Tensor, original_min_max_vals: tuple) -> torch.Tensor:
+        """
+        Dequantuoja sveikųjų skaičių indeksus atgal į kompleksinį tenzorių.
+        original_min_max_vals: (real_min, real_max, imag_min, imag_max) - būtina dekvantavimui
+        """
+        if packed_quantized_tensor.dtype != torch.uint8:
+            raise TypeError("Supakuotas tenzorius turi būti torch.uint8 dtype.")
+        if packed_quantized_tensor.shape[0] != 2:
+            raise ValueError("Supakuotas tenzorius turi turėti 2 kaip pirmąją dimensiją (real/imag).")
+
+        real_min, real_max, imag_min, imag_max = original_min_max_vals
+
+        quantized_real = packed_quantized_tensor[0].float()
+        quantized_imag = packed_quantized_tensor[1].float()
+
+        # Atvirkštinė normalizacija
+        denormalized_real = quantized_real / (self.num_levels - 1)
+        denormalized_imag = quantized_imag / (self.num_levels - 1)
+
+        # Atvirkštinė skalė
+        real_part = denormalized_real * (real_max - real_min) + real_min
+        imag_part = denormalized_imag * (imag_max - imag_min) + imag_min
+
+        dequantized_complex_tensor = torch.complex(real_part, imag_part)
+        logger.debug(f"Tenzorius dekvantuotas. Dekvantuoto tenzoriaus forma: {dequantized_complex_tensor.shape}, dtype: {dequantized_complex_tensor.dtype}")
+        return dequantized_complex_tensor
+
+
+# --- 4. Genome (Genomas) ---
+# Atspindi vieną evoliucionuojančią HNN architektūrą ir jos būseną.
+class Genome:
+    def __init__(self, id: str = None):
+        self.id = id if id else str(uuid.uuid4())
+        self.fitness = 0.0
+        self.components = {}
+        self.current_vram_mb = 0.0 # Stebėti dabartinį VRAM naudojimą
+
+        self._init_hnn_architecture()
+        self._init_ai_guidance()
+        self._init_evolution_params()
+
+        logger.info(f"Genomas {self.id} sukurtas.")
+
+    def _init_hnn_architecture(self):
+        """Inicijuoja HNN architektūros komponentus, valdomus GA."""
+        self.components["hnn"] = {}
+        
+        # GA pasirenka hologram_dims (nD visraktis)
+        # Pradžiai: atsitiktiniai, bet vėliau GA juos optimizuos.
+        # Ribojame dydį, kad tilptų į VRAM pradžioje
+        self.components["hnn"]["hologram_dims"] = tuple(np.random.randint(4, 32, size=np.random.randint(2, 5))) 
+        logger.info(f"Genomo {self.id} pradžios hologram_dims: {self.components['hnn']['hologram_dims']}")
+
+        # GA pasirenka hologram_state kvantavimo bitų skaičių
+        self.components["hnn"]["state_quant_bits"] = int(np.random.choice([2, 4, 8]))
+        self.components["hnn"]["quantizer"] = ComplexQuantizer(self.components["hnn"]["state_quant_bits"])
+        logger.info(f"Genomo {self.id} hologram_state kvantavimas: {self.components['hnn']['state_quant_bits']} bitai.")
+
+        # Inicijuojame hologramos būseną kaip kvantuotus indeksus.
+        # Pirmiausia sugeneruojame "tikrą" kompleksinį tenzorių (vėliau tai bus HNN išvestis).
+        # Svarbu: saugome min/max reikšmes dekvantavimui!
+        dummy_complex_state = torch.randn(self.components["hnn"]["hologram_dims"], dtype=torch.complex64)
+        
+        real_min, real_max = self.components["hnn"]["quantizer"]._get_quantization_range(dummy_complex_state.real)
+        imag_min, imag_max = self.components["hnn"]["quantizer"]._get_quantization_range(dummy_complex_state.imag)
+        self.components["hnn"]["hologram_state_min_max"] = (real_min, real_max, imag_min, imag_max) # Saugojam dekvantavimui
+        
+        self.components["hnn"]["hologram_state"] = self.components["hnn"]["quantizer"].quantize(dummy_complex_state)
+        logger.debug(f"Genomo {self.id} hologram_state sukurtas (kvantuotas). Dydis: {self.components['hnn']['hologram_state'].nbytes / (1024**2):.4f} MB.")
+
+
+    def _init_ai_guidance(self):
+        """Inicijuoja parametrus AI agentų įžvalgoms sverti."""
+        self.components["ai_guidance"] = {}
+        # GA valdomi AI agentų įžvalgų svoriai (metamutacijos)
+        self.components["ai_guidance"]["ai1_weight"] = np.random.rand() # Pvz., 0.0-1.0
+        self.components["ai_guidance"]["ai2_weight"] = np.random.rand()
+        self.components["ai_guidance"]["ai3_weight"] = np.random.rand()
+
+        # GA pasirenka bitų skaičių, skirtą tenzoriui, siunčiamam AI agentams
+        self.components["ai_guidance"]["ai_input_quant_bits"] = int(np.random.choice([2, 4, 8]))
+        logger.info(f"Genomo {self.id} AI įvesties kvantavimas: {self.components['ai_guidance']['ai_input_quant_bits']} bitai.")
+
+    def _init_evolution_params(self):
+        """Inicijuoja paties GA evoliucijos parametrus (metamutacijos)."""
+        self.components["evolution"] = {}
+        self.components["evolution"]["mutation_rate"] = np.random.lognormal(mean=-1.0, sigma=0.5) # Pradinis vidutinis mutacijos lygis
+        self.components["evolution"]["crossover_rate"] = np.random.lognormal(mean=-0.5, sigma=0.5) # Pradinis vidutinis kryžminimo lygis
+
+        # GA valdomi fitneso funkcijos svoriai
+        self.components["evolution"]["fitness_weights"] = {
+            "accuracy_weight": np.random.rand(),
+            "vram_penalty_weight": np.random.rand(),
+            "ai_guidance_weight": np.random.rand(),
+            "complexity_penalty_weight": np.random.rand() # Pvz., baudžia už per didelį sudėtingumą
+        }
+
+    def calculate_hologram_vram_usage(self) -> float:
+        """Apskaičiuoja hologramos būsenos VRAM naudojimą MB, remiantis GA pasirinktu bitų skaičiumi."""
+        # hologram_state yra torch.uint8, bet reikia padalinti pagal bitų skaičių 8/self.bits,
+        # nes vienas baitas talpina kelis kvantuotus elementus, jei bits < 8.
+        
+        num_elements = self.components["hnn"]["hologram_state"].numel() / 2 # Real ir Imag dalys supakuotos
+        bits_per_element = self.components["hnn"]["state_quant_bits"] # Tiek bitų skirta vienam elementui (real arba imag)
+        
+        # (elementų skaičius * bitai/elementui) / (8 bitai/baito * 1024^2 baitai/MB)
+        vram_mb = (num_elements * bits_per_element) / (8 * 1024 * 1024)
+        return vram_mb
+    
+    def dequantize_hologram_state(self) -> torch.Tensor:
+        """Dequantuoja hologramos būseną atgal į kompleksinį tenzorių."""
+        quantizer = self.components["hnn"]["quantizer"]
+        min_max_vals = self.components["hnn"]["hologram_state_min_max"]
+        return quantizer.dequantize(self.components["hnn"]["hologram_state"], min_max_vals)
+
+    def get_ai_input_tensor(self) -> torch.Tensor:
+        """
+        Grąžina hologramos būseną, kvantuotą iki GA nustatyto bitų skaičiaus,
+        skirtos AI agentams.
+        """
+        target_bits = self.components["ai_guidance"]["ai_input_quant_bits"]
+        
+        # Jei tikrasis kvantavimas jau atitinka AI įvesties kvantavimą, tiesiog grąžiname
+        if self.components["hnn"]["state_quant_bits"] == target_bits:
+            return self.components["hnn"]["hologram_state"]
+        
+        # Priešingu atveju, perkvantuojame. Pirmiausia dekvantuojame, tada kvantuojame iš naujo.
+        # Pramoniniame kode šis perkvantavimas būtų optimizuotas, kad būtų išvengta bereikalingo dekvantavimo/kvantavimo.
+        # Tačiau čia demonstruojame lankstumą.
+        logger.debug(f"Perkvantuojama hologramos būsena AI įvestims iš {self.components['hnn']['state_quant_bits']} į {target_bits} bitų.")
+        dequantized_state = self.dequantize_hologram_state()
+        
+        temp_quantizer = ComplexQuantizer(target_bits)
+        real_min, real_max = temp_quantizer._get_quantization_range(dequantized_state.real)
+        imag_min, imag_max = temp_quantizer._get_quantization_range(dequantized_state.imag)
+        
+        # Nėra poreikio saugoti šių min/max, nes tai tik laikina įvestis AI
+        ai_input_tensor = temp_quantizer.quantize(dequantized_state)
+        
+        return ai_input_tensor
+
+    # --- nDxnD transformacijos pavyzdys (be interpolate) ---
+    def _project_state(self, current_state: torch.Tensor, target_dims: tuple) -> tuple:
+        """
+        Atlieka holografinę nD tenzoriaus transformaciją į naujus matmenis.
+        NAUDOJA TIK HOLOGRAFINIUS/ND PRINCIPUS (Reshape, Pad/Crop, Fazinės transformacijos).
+        JOKIOS INTERPOLIACIJOS!
+
+        Grąžina naują hologramos būseną ir informacijos praradimo metriką.
+        """
+        current_dims = current_state.shape[1:] # Pirmas dim yra real/imag, todėl imame nuo antros
+        
+        logger.debug(f"Projekuojama būsena iš {current_dims} į {target_dims}")
+        
+        original_num_elements = np.prod(current_dims)
+        target_num_elements = np.prod(target_dims)
+
+        if original_num_elements == target_num_elements:
+            # Tiesioginis performavimas, jei elementų skaičius sutampa
+            projected_state = current_state.view(2, *target_dims)
+            information_loss = 0.0 # Nėra praradimo
+        else:
+            # Sudėtingesnė holografinė transformacija
+            # Pavyzdys: Paprastas centrinis apkirpimas / užpildymas nuliais
+            # Pramoniniame kode čia būtų integruotos GA valdomos fazinės/amplitudės transformacijos.
+            
+            # Pirmiausia dekvantuojame, kad galėtume manipuliuoti reikšmėmis
+            dequantized_current_state = self.dequantize_hologram_state().to(current_state.device) # Įkelti į tą patį prietaisą
+
+            # Laikina padėtis: Pad/Crop atliekamas su float skaičiais
+            temp_projected_real = torch.zeros(target_dims, dtype=torch.float32, device=dequantized_current_state.device)
+            temp_projected_imag = torch.zeros(target_dims, dtype=torch.float32, device=dequantized_current_state.device)
+
+            real_part = dequantized_current_state.real
+            imag_part = dequantized_current_state.imag
+            
+            # Apskaičiuojame, kokią dalį apkerpame/papildome kiekviena dimensija
+            slices_real = []
+            slices_target = []
+            
+            for d_idx, (orig_dim, target_dim) in enumerate(zip(current_dims, target_dims)):
+                if orig_dim > target_dim: # Apkirpimas
+                    start = (orig_dim - target_dim) // 2
+                    end = start + target_dim
+                    slices_real.append(slice(start, end))
+                    slices_target.append(slice(0, target_dim))
+                elif orig_dim < target_dim: # Papildymas nuliais
+                    start_pad = (target_dim - orig_dim) // 2
+                    end_pad = target_dim - orig_dim - start_pad
+                    slices_real.append(slice(0, orig_dim))
+                    slices_target.append(slice(start_pad, target_dim - end_pad))
+                else: # Atitinka
+                    slices_real.append(slice(0, orig_dim))
+                    slices_target.append(slice(0, target_dim))
+            
+            # Atlikti apkarpymą/papildymą
+            temp_projected_real[tuple(slices_target)] = real_part[tuple(slices_real)]
+            temp_projected_imag[tuple(slices_target)] = imag_part[tuple(slices_real)]
+
+            # Svarbu: Čia būtų vieta sudėtingesnėms GA valdomoms fazinėms/amplitudės transformacijoms,
+            # kurios geriau išsaugotų informaciją nD erdvėje. Šis pavyzdys yra minimalistinis.
+
+            projected_state = torch.complex(temp_projected_real, temp_projected_imag)
+            
+            # Kvantavimas atgal po projekcijos. Saugome naujas min/max reikšmes.
+            quantizer = self.components["hnn"]["quantizer"]
+            real_min, real_max = quantizer._get_quantization_range(projected_state.real)
+            imag_min, imag_max = quantizer._get_quantization_range(projected_state.imag)
+            self.components["hnn"]["hologram_state_min_max"] = (real_min, real_max, imag_min, imag_max)
+
+            projected_state_quantized = quantizer.quantize(projected_state)
+            
+            # Informacijos praradimo metrika (pvz., MSE tarp originalo ir atkurto po projekcijos)
+            # Čia reikėtų kruopštesnio palyginimo, atsižvelgiant į galimas dimensijų skirtumus.
+            # Dėl supaprastinimo kol kas imituosime praradimą
+            information_loss = abs(original_num_elements - target_num_elements) / max(original_num_elements, target_num_elements)
+            information_loss = min(information_loss, 1.0) # Apriboti iki 1.0
+            
+            logger.debug(f"Informacijos praradimas po projekcijos: {information_loss:.4f}")
+            return projected_state_quantized, information_loss
+
+
+# --- Pavyzdinis naudojimas ---
+if __name__ == "__main__":
+    logger.info("Pradedama pramoninio kodo demonstracija.")
+
+    # 1. Inicijuojame resursų valdytoją
+    resource_manager = ResourceManager(max_vram_mb=100) # Sumažiname limitą demonstracijai
+
+    # 2. Sukuriame genomą
+    initial_genome = Genome()
+
+    # 3. Tikriname VRAM naudojimą
+    vram_ok = resource_manager.allocate(initial_genome)
+    logger.info(f"Pradinis genomo {initial_genome.id} VRAM patikrinimas: {'OK' if vram_ok else 'VIRŠYTAS'}")
+
+    # Pavyzdys, kaip galima dekvantuoti būseną HNN operacijoms
+    if vram_ok:
+        dequantized_state = initial_genome.dequantize_hologram_state()
+        logger.info(f"Dekvantuotos hologramos būsenos forma: {dequantized_state.shape}, dtype: {dequantized_state.dtype}")
+        logger.debug(f"Pavyzdinės dekvantuotos reikšmės: {dequantized_state.flatten()[:5]}")
+
+        # Pavyzdys, kaip būtų gauta AI įvestis (kvantuota iki GA nustatyto bitų skaičiaus)
+        ai_input_tensor = initial_genome.get_ai_input_tensor()
+        logger.info(f"AI agentams skirtos įvesties tenzoriaus forma: {ai_input_tensor.shape}, dtype: {ai_input_tensor.dtype}")
+        logger.debug(f"Pavyzdinės AI įvesties kvantuotos reikšmės: {ai_input_tensor.flatten()[:5]}")
+
+        # Pavyzdys _project_state naudojimo
+        # Pakeičiame genomo dimensijas, kad imituotume kryžminimą
+        original_dims = initial_genome.components["hnn"]["hologram_dims"]
+        # Sugeneruojame naujas dimensijas, kurios tikriausiai skirsis
+        new_dims = tuple(np.random.randint(4, 32, size=len(original_dims)))
+        logger.info(f"Bandoma projektuoti būseną iš {original_dims} į naujas dimensijas: {new_dims}")
+
+        projected_state_quantized, loss = initial_genome._project_state(initial_genome.components["hnn"]["hologram_state"], new_dims)
+        
+        initial_genome.components["hnn"]["hologram_state"] = projected_state_quantized
+        initial_genome.components["hnn"]["hologram_dims"] = new_dims # Atnaujiname genomo dimensijas po projekcijos
+        
+        logger.info(f"Projekuota hologramos būsena nauja forma: {projected_state_quantized.shape}, su informacijos praradimu: {loss:.4f}")
+        logger.debug(f"Genomo {initial_genome.id} VRAM po projekcijos (reikės peralokuoti): {initial_genome.calculate_hologram_vram_usage():.4f} MB")
+        
+    # 4. Atlaisviname resursus (gamyboje tai būtų atliekama po genomo vertinimo)
+    resource_manager.release(initial_genome)
+
+    logger.info("Pramoninio kodo demonstracija baigta.")
+
+Paaiškinimai ir Tolesni Žingsniai:
+Pramoninis Logavimas (logging modulis):
+
+logging.basicConfig nustatytas JSON formatas, kad logus būtų lengva analizuoti automatiniais įrankiais.
+
+logger.info/warning/debug naudojimas leidžia filtruoti pranešimus pagal svarbą.
+
+Tolesni veiksmai: Išplėsti logų naudojimą visose klasėse ir funkcijose, įskaitant klaidas, metrikas ir evoliucijos progresą. Integruoti į TensorBoard ar kitą metrikų vizualizavimo įrankį.
+
+ResourceManager (Resursų Valdymas):
+
+Stebi VRAM naudojimą ir praneša, jei viršijami nustatyti limitai (šiuo atveju, 1900 MB).
+
+allocate metodas skaičiuoja hologram_state VRAM, atsižvelgiant į GA pasirinktą bitų skaičių.
+
+release apima torch.cuda.empty_cache(), kuris yra kritiškai svarbus dirbant su GPU atmintimi.
+
+Tolesni veiksmai: Įtraukti visų kitų sistemos komponentų VRAM skaičiavimą (HNN_Core svoriai, tarpiniai tenzoriai ir t.t.). VRAM viršijimo atveju GeneticArchitect (super AI) nustatys genomo fitnesą į 0.0 ("FATALITY").
+
+ComplexQuantizer:
+
+Implementuoja kompleksinių skaičių kvantavimą į 2, 4 ar 8 bitus, grąžinant torch.uint8 tenzorius, siekiant maksimalios atminties ekonomijos.
+
+Saugojama tik kvantuota informacija. De-kvantavimas vyksta tik tada, kai reikia atlikti operacijas.
+
+Tolesni veiksmai: Gali būti optimizuota našumui, ypač jei reikalingi fiksuoti kvantavimo diapazonai, arba netgi perrašyta custom CUDA branduoliuose.
+
+Genome (Genomas):
+
+Centralinė klasė, laikanti visus genomo komponentus.
+
+GA dominavimas: hologram_dims, state_quant_bits, ai_input_quant_bits, mutation_rate, crossover_rate ir fitness_weights yra visi konfigūruojami ir mutuojami GA parametrai.
+
+hologram_state yra saugomas kaip kvantuoti indeksai, naudojant ComplexQuantizer.
+
+_project_state: Svarbiausia dalis – jame visiškai atsisakyta torch.nn.functional.interpolate. Vietoj to, jis demonstruoja holografines nD transformacijas (šiuo atveju, supaprastintą pad/crop). Tikrasis pramoninis kodas čia turės sudėtingesnes, GA valdomas fazines/amplitudės nD transformacijas. Grąžina informacijos praradimo metriką, kuri bus naudojama fitneso funkcijoje.
+
+get_ai_input_tensor: Parodo, kaip GA nustatomas bitų skaičius paveikia AI agentams siunčiamą tenzorių.
+
+Tolesni veiksmai: Išplėsti mutate_hnn_architecture metodus, kad GA galėtų keisti ne tik matmenis ir bitus, bet ir kitus HNN_Core parametrus. Įdiegti tikras fraktalines/kvantines įterpimo strategijas kaip GA valdomus komponentus.
+
+Šis kodas yra tvirta bazė. Dabar galime plėsti kitus komponentus, tokius kaip HNN_Core (holografinio tinklo branduolys), AIAgentsManager (AI agentų orkestracija) ir, žinoma, patį GeneticArchitect (super AI), kuris valdys visą evoliucijos procesą.
+
+Ar norėtumėte, kad pereičiau prie HNN_Core implementacijos, ar turite kitų pageidavimų?

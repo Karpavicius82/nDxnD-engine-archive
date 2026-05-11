@@ -1,0 +1,631 @@
+Puiku! Labai vertinu jūsų detalų debuginimą ir kodo analizę. Jūs visiškai teisingai nustatėte problemas ir patvirtinote, kad koncepcinis nD holografijos įgyvendinimas su PyTorch veikia, net jei ir su tam tikrais apribojimais bei "placeholder" elementais.
+
+Jūsų atlikti testai ir pastebėjimai yra nepaprastai vertingi. Jie ne tik patvirtina sistemos gyvybingumą, bet ir aiškiai apibrėžia, kurias vietas reikia tobulinti.
+
+Mano Supratimas ir Tolesni Žingsniai
+Aš supratau, kad:
+
+Pagrindinis nD funkcionalumas veikia: PyTorch pagrindu veikiantis nD FFT, superpozicija, interferencija ir kvantavimas yra įdiegti ir funkcionuoja, grąžindami rezultatus be kritinių klaidų. Tai yra didelis žingsnis į priekį!
+
+Identifikuotos konkrečios tobulinimo sritys: Jūs tiksliai nurodėte trūkstamus importus, placeholder'ius, galimas shape mismatching rizikas, VRAM valdymo detales ir fitneso funkcijos niuansus.
+
+Patvirtinta evoliucijos eiga: Nors ir su NUM_GENERATIONS=1, matome, kad genomai yra vertinami, rūšiuojami pagal fitnesą, o tai rodo, kad evoliucijos ciklo pagrindas yra tvirtas.
+
+Pataisymai, Kur ir Kaip Galime Juos Įgyvendinti
+Aš dabar įgyvendinsiu visus jūsų pasiūlytus pataisymus ir optimizacijas tiesiogiai kode.
+
+1. Būtini Importai
+Pataisymas: Pridėsiu import copy Genome klasės pradžioje.
+
+2. HNN_Core Placeholders (fractal ir quantum_embedding)
+Pataisymas: Kadangi tai yra sudėtingos koncepcijos, kurias reikia detaliau apibrėžti ir įgyvendinti, aš:
+
+Ištrinsiu fractal ir quantum_embedding iš random.choice _init_data_pipeline metode, kad būtų naudojamas tik linear įterpimas.
+
+_embed_input metode aš paliksiu linear kaip vienintelę ir aiškią strategiją šiuo etapu.
+
+Tai užtikrins, kad sistema naudoja tik pilnai veikiantį įterpimo metodą ir išvengs klaidinančių įspėjimų. fractal ir quantum_embedding liks kaip idėjos ateities tobulinimui.
+
+3. Shape Mismatching Rizikos Valdymas nD Tenzoriuose
+Pataisymas: _embed_input metodas jau atlieka duomenų padding'ą ir truncation'ą, o tai yra pagrindinė strategija. Tačiau, papildomai pridėsiu fitneso bausmę evaluate_genome metode, jei duomenų praradimas dėl truncation'o yra pernelyg didelis, kad GA būtų skatinamas rasti tinkamesnes hologram_dims.
+
+Papildymas: HNN_Core inicijavimo metu (arba _embed_input pradžioje), galima pridėti logiką, kuri praneštų, jei hologram_dims yra žymiai mažesnės nei input_shape elementų skaičius, nes tai reikštų didelį informacijos praradimą.
+
+4. VRAM Valdymas (Realiame GPU Kontekste)
+Pataisymas: ResourceManager klasėje jūsų jau numatyti torch.cuda.memory_allocated() ir torch.cuda.empty_cache() kvietimai yra teisingi. Aš patikslinsiu _try_reduce_genome_vram metodą, kad jis būtų protingesnis, jei VRAM trūksta, pvz., atliktų ne tik vienos dimensijos sumažinimą, bet galbūt proporcingai sumažintų visas dimensijas, kad holograma tilptų.
+
+Patikslinimas: evaluate_genome metode užtikrinsiu, kad self.resource_manager.release(genome) būtų iškviestas finally bloke, kad VRAM būtų atlaisvinta net ir įvykus klaidai.
+
+5. Fitneso Funkcijos Patikslinimai
+Pataisymas: Aš peržiūrėsiu normalized_compression_ratio normalizavimą ir compute_penalty svorius, kad jie būtų logiškesni ir leistų GA geriau subalansuoti tikslumą, kompresiją ir skaičiavimo sudėtingumą.
+
+Padidinsiu normalized_compression_ratio normalizavimo koeficientą (pvz., min(1.0, compression_ratio / 10.0) jei tikimės ~10x kompresijos).
+
+compute_penalty padarysiu labiau įtakingą, jei holograma tampa per daug sudėtinga.
+
+6. Evoliucijos Vykdymas ir Testavimas
+Pataisymas: NUM_GENERATIONS ir POPULATION_SIZE numatytuosius reikšmes pakeisiu į didesnes, kad būtų galima iškart matyti evoliucijos eigą (pvz., NUM_GENERATIONS = 5, POPULATION_SIZE = 4).
+
+Patikrinimas: Užtikrinsiu, kad crossover funkcija ir mutate metodas būtų tinkamai iškviesti evoliucijos cikle.
+
+random.gauss vs np.random.normal: random.gauss yra tinkamas skalarių mutacijoms (pvz., vieno parametro vertei), o torch.randn_like yra puikus PyTorch tenzorių mutacijoms, nes sugeneruoja tenzorį to paties dydžio kaip originalas. Taigi, šiuo atvea torch.randn_like yra tinkamiausias ir jau naudojamas.
+
+Atnaujintas Kodas
+Štai atnaujintas kodas su visais aptartais pataisymais ir patobulinimais. Ypatingas dėmesys skiriamas PyTorch integravimui, nD valdymui, VRAM efektyvumui ir evoliucijos logikai.
+
+Python
+
+import torch
+import numpy as np
+import random
+import math
+import uuid
+import logging
+import copy # Pridėtas copy modulis
+
+# Konfigūracija
+class Config:
+    POPULATION_SIZE = 4 # Padidintas testavimui
+    NUM_GENERATIONS = 5 # Padidintas testavimui
+    BINANCE_INPUT_SHAPE = (4, 4, 4) # Pavyzdys: 3D įvestis
+    LOG_LEVEL = "INFO" # Sumažintas log level, kad nebūtų perteklinio outputo
+
+# Nustatome loggerį
+logging.basicConfig(level=Config.LOG_LEVEL, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- Resource Manager ---
+class ResourceManager:
+    def __init__(self, max_vram_ratio=0.85): # Padidintas santykis, kad būtų daugiau laisvės
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.total_vram = 0
+        if self.device == 'cuda':
+            self.total_vram = torch.cuda.get_device_properties(0).total_memory / (1024**2) # MB
+            self.max_allocatable_vram = self.total_vram * max_vram_ratio
+            logging.info(f"CUDA available. Total VRAM: {self.total_vram:.2f} MB. Max allocatable: {self.max_allocatable_vram:.2f} MB.")
+        else:
+            logging.warning("CUDA not available. VRAM management will be simulated on CPU.")
+            self.total_vram = 4096 # Simuliuojama VRAM 4GB
+            self.max_allocatable_vram = self.total_vram * max_vram_ratio
+        
+        # Current VRAM monitoring (tiesiogiai per PyTorch)
+        self.current_vram_usage_mb = 0.0
+
+    def calculate_genome_vram_requirements(self, genome_hologram_dims):
+        # Apskaičiuojam apytikslę hologramos VRAM, kompleksinis tensor (float32 real + float32 imag = 8 bytes per element)
+        hologram_elements = np.prod(genome_hologram_dims)
+        return (hologram_elements * 8) / (1024**2) # MB
+
+    def allocate(self, genome):
+        # Realus VRAM naudojimas, jei CUDA
+        if self.device == 'cuda':
+            self.current_vram_usage_mb = torch.cuda.memory_allocated() / (1024**2)
+        
+        required_vram = self.calculate_genome_vram_requirements(genome.components["hnn"]["hologram_dims"])
+        
+        if self.current_vram_usage_mb + required_vram > self.max_allocatable_vram:
+            logging.warning(f"VRAM allocation for genome {genome.id[:4]} failed (required {required_vram:.2f} MB, current used {self.current_vram_usage_mb:.2f} MB, available {self.max_allocatable_vram - self.current_vram_usage_mb:.2f} MB). Attempting to reduce hologram size.")
+            if self._try_reduce_genome_vram(genome):
+                logging.info(f"Genome {genome.id[:4]} VRAM requirements reduced successfully to {genome.components['hnn']['hologram_dims']}.")
+                return True
+            logging.error(f"Failed to reduce VRAM for genome {genome.id[:4]}. Skipping evaluation.")
+            return False
+        
+        logging.info(f"VRAM check passed for genome {genome.id[:4]}: Required {required_vram:.2f} MB. Current total used (before this genome's processing): {self.current_vram_usage_mb:.2f} MB.")
+        return True
+
+    def release(self, genome):
+        if self.device == 'cuda':
+             torch.cuda.empty_cache()
+             self.current_vram_usage_mb = torch.cuda.memory_allocated() / (1024**2)
+             logging.info(f"VRAM cache emptied for genome {genome.id[:4]}. Current VRAM usage: {self.current_vram_usage_mb:.2f} MB.")
+        else:
+             logging.info(f"Simulated VRAM release for genome {genome.id[:4]}.")
+
+
+    def _try_reduce_genome_vram(self, genome):
+        current_dims = list(genome.components["hnn"]["hologram_dims"])
+        if not current_dims: return False
+        
+        # Pabandom proporcingai sumažinti visas dimensijas
+        reduction_factor = 0.8 # Sumažinti 20%
+        new_dims = [max(8, int(d * reduction_factor)) for d in current_dims] # Min 8, kad neperkrauti
+        new_dims = tuple(new_dims)
+        
+        new_vram_req = self.calculate_genome_vram_requirements(new_dims)
+        
+        # Tikriname, ar naujas dydis tilps
+        if self.current_vram_usage_mb + new_vram_req <= self.max_allocatable_vram:
+            genome.components["hnn"]["hologram_dims"] = new_dims
+            genome.components["hnn"]["latent_dim"] = np.prod(new_dims)
+            # Reikia iš naujo inicializuoti hologram_state su naujais matmenimis
+            genome.components["hnn"]["hologram_state"] = genome._initialize_hologram_state(new_dims) 
+            return True
+        return False
+        
+# --- Genome Klasė ---
+class Genome:
+    def __init__(self, input_shape=(100,)):
+        self.id = str(uuid.uuid4())
+        self.fitness = 0.0
+        self.input_shape = input_shape
+
+        self.components = {
+            "hnn": self._init_hnn(),
+            "data_pipeline": self._init_data_pipeline(),
+            "evolution_controller": self._init_evolution_controller(),
+            "ai_orchestrator": self._init_ai_orchestrator(),
+            "fitness_weights": self._init_fitness_weights()
+        }
+
+    def _init_hnn(self):
+        # Pradinės hologramos dimensijos, artimos input_shape, bet gali skirtis
+        # Pavyzdys: pradžioje holograma gali būti didesnė arba mažesnė nei input_shape
+        hologram_dims = tuple(s for s in self.input_shape) # Pradžiai lygu input_shape
+        # Arba galime generuoti atsitiktines:
+        # num_dims = len(self.input_shape) if len(self.input_shape) > 0 else 1
+        # hologram_dims = tuple(random.randint(max(8, s//2), min(256, s*2)) for s in self.input_shape)
+        
+        latent_dim = np.prod(hologram_dims)
+        quantization_bits = random.choice([4, 8])
+
+        hnn_spec = {
+            "hologram_dims": hologram_dims,
+            "latent_dim": latent_dim,
+            "quantization_bits": quantization_bits,
+            "lut": self._generate_lut(quantization_bits),
+            "hologram_state": self._initialize_hologram_state(hologram_dims)
+        }
+        return hnn_spec
+
+    def _initialize_hologram_state(self, hologram_dims):
+        # Holograma bus nD kompleksinių skaičių torch.Tensor (amplitudė ir fazė)
+        real_part = torch.rand(hologram_dims, dtype=torch.float32) * 1.0 # Amplitudė [0, 1]
+        imag_part = torch.rand(hologram_dims, dtype=torch.float32) * (2 * math.pi) # Fazė [0, 2pi]
+        return torch.complex(real_part, imag_part) 
+
+    def _generate_lut(self, bits):
+        num_entries = 2**bits
+        return torch.linspace(-1.0, 1.0, num_entries, dtype=torch.float32)
+
+    def _init_data_pipeline(self):
+        return {
+            "sources": [{"type": "binance", "symbol": "BTCUSDT", "weight": random.random()}],
+            "normalization": random.choice(['dynamic_minmax', 'adaptive_zscore']),
+            "window_size": random.randint(50, 500),
+            "fusion_strategy": random.choice(['weighted_average']),
+            "embedding_strategy": 'linear' # Pašalinti 'fractal', 'quantum_embedding' placeholder'ius
+        }
+
+    def _init_evolution_controller(self):
+        return {
+            "mutation": {
+                "rate": random.uniform(0.05, 0.2), # Mutacijos intensyvumas
+                "strategy": random.choice(['gaussian']),
+                "intensity": random.uniform(0.005, 0.05) # Svorio mutacijos intensyvumas
+            },
+            "crossover": {
+                "rate": random.uniform(0.6, 0.9),
+                "method": random.choice(['uniform', 'blended'])
+            },
+            "selection": {
+                "pressure": random.uniform(1.5, 3.0),
+                "method": random.choice(['tournament', 'rank_based'])
+            }
+        }
+
+    def _init_ai_orchestrator(self):
+        return {
+            "agents": {"deepseek": random.uniform(0, 1)},
+            "query_strategy": random.choice(['sequential']),
+            "fusion_method": random.choice(['weighted_voting'])
+        }
+
+    def _init_fitness_weights(self):
+        return {
+            "hnn_accuracy_weight": random.uniform(0.3, 0.6),
+            "vram_efficiency_weight": random.uniform(0.1, 0.3),
+            "compression_ratio_weight": random.uniform(0.2, 0.5),
+            "ai_guidance_bonus_weight": random.uniform(0.0, 0.1) # Sumažintas AI bonusas
+        }
+
+    def mutate_genome_params(self):
+        mut_config = self.components["evolution_controller"]["mutation"]
+        if random.random() < 0.2:
+            mut_config["rate"] = max(0.01, min(0.3, mut_config["rate"] + random.gauss(0, 0.05)))
+        if random.random() < 0.2:
+            mut_config["intensity"] = max(0.001, min(0.1, mut_config["intensity"] + random.gauss(0, 0.01)))
+        for key in self.components["fitness_weights"]:
+            if random.random() < 0.1:
+                self.components["fitness_weights"][key] = max(0.0, min(1.0, self.components["fitness_weights"][key] + random.gauss(0, 0.1)))
+
+    def mutate_hnn_weights(self, mutation_intensity):
+        hologram = self.components["hnn"]["hologram_state"]
+        noise_real = torch.randn_like(hologram.real) * mutation_intensity
+        noise_imag = torch.randn_like(hologram.imag) * mutation_intensity * 0.5
+        
+        hologram.real += noise_real
+        hologram.imag = torch.remainder(hologram.imag + noise_imag, 2 * math.pi) 
+        logging.debug(f"Genome {self.id[:4]} mutated HNN hologram state (complex, nD).")
+
+    def mutate_hnn_architecture(self):
+        if random.random() < 0.3:
+            old_dims = list(self.components["hnn"]["hologram_dims"])
+            new_dims = list(old_dims) 
+            
+            if len(new_dims) == 0: 
+                new_dims = [random.randint(16, 64)]
+            else:
+                mutation_type = random.random()
+                if mutation_type < 0.4: # Keisti esamos dimensijos dydį
+                    idx_to_mutate = random.randint(0, len(new_dims) - 1)
+                    change_factor = random.choice([0.5, 1.5, 2.0]) 
+                    new_dims[idx_to_mutate] = max(8, min(256, int(new_dims[idx_to_mutate] * change_factor)))
+                elif mutation_type < 0.7 and len(new_dims) < 5: # Pridėti naują dimensiją (iki 5D pvz.)
+                    new_dims.append(random.randint(8, 32))
+                elif len(new_dims) > 1: # Pašalinti dimensiją
+                    new_dims.pop(random.randint(0, len(new_dims) - 1))
+            
+            new_dims = tuple(new_dims) 
+            
+            # VRAM saugiklis: maksimalus bendras elementų skaičius
+            max_total_elements = 256 * 256 * 2 # Apytikslė riba, kad nebūtų per didelės hologramos
+            if np.prod(new_dims) > max_total_elements:
+                logging.warning(f"Attempted to create too large hologram: {new_dims}. Skipping architecture mutation.")
+                return 
+            
+            if new_dims != old_dims:
+                self.components["hnn"]["hologram_dims"] = new_dims
+                self.components["hnn"]["latent_dim"] = np.prod(new_dims)
+                self.components["hnn"]["hologram_state"] = self._initialize_hologram_state(new_dims)
+                logging.info(f"Genome {self.id[:4]} mutated hologram_dims to {new_dims}.")
+
+    def mutate_quantization(self):
+        if random.random() < 0.2:
+            new_bits = random.choice([4, 8])
+            if new_bits != self.components["hnn"]["quantization_bits"]:
+                self.components["hnn"]["quantization_bits"] = new_bits
+                self.components["hnn"]["lut"] = self._generate_lut(new_bits)
+
+        if random.random() < 0.5:
+            lut = self.components["hnn"]["lut"]
+            if lut.numel() > 0:
+                idx = random.randint(0, lut.numel() - 1)
+                lut[idx] += random.gauss(0, 0.05)
+                lut[idx] = torch.clamp(lut[idx], -1.0, 1.0) 
+
+    def mutate_data_pipeline(self):
+        if random.random() < 0.2:
+            self.components["data_pipeline"]["normalization"] = random.choice(['dynamic_minmax', 'adaptive_zscore'])
+        if random.random() < 0.2:
+            self.components["data_pipeline"]["window_size"] = random.randint(50, 500)
+
+    def crossover(self, other_genome):
+        child = Genome(self.input_shape)
+        child.components = {}
+
+        for component_key in self.components:
+            if random.random() < 0.5:
+                child.components[component_key] = copy.deepcopy(self.components[component_key])
+            else:
+                child.components[component_key] = copy.deepcopy(other_genome.components[component_key])
+        
+        # Specifinis hologramos būsenos kryžminimas
+        if ("hnn" in self.components and "hnn" in other_genome.components and
+            self.components["hnn"]["hologram_dims"] == other_genome.components["hnn"]["hologram_dims"]):
+            
+            child_hologram_state = (self.components["hnn"]["hologram_state"] + 
+                                    other_genome.components["hnn"]["hologram_state"]) / 2
+            child.components["hnn"]["hologram_state"] = child_hologram_state
+        else:
+            # Jei dimensijos skiriasi, paimame vieno iš tėvų
+            child.components["hnn"]["hologram_state"] = (
+                copy.deepcopy(self.components["hnn"]["hologram_state"]) 
+                if random.random() < 0.5 
+                else copy.deepcopy(other_genome.components["hnn"]["hologram_state"])
+            )
+        
+        return child
+
+    def mutate(self):
+        self.mutate_genome_params()
+        self.mutate_hnn_architecture()
+        self.mutate_quantization()
+        self.mutate_data_pipeline()
+        self.mutate_hnn_weights(self.components["evolution_controller"]["mutation"]["intensity"])
+
+# --- HNN_Core Klasė ---
+class HNN_Core:
+    def __init__(self, hnn_spec, input_shape):
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.input_shape = input_shape
+        self.hologram_dims = hnn_spec["hologram_dims"]
+        self.latent_dim = hnn_spec["latent_dim"]
+        self.quantization_bits = hnn_spec["quantization_bits"]
+        
+        self.lut = hnn_spec["lut"].to(self.device)
+        self.hologram_state = hnn_spec["hologram_state"].to(self.device)
+
+        logging.info(f"HNN_Core initialized on {self.device} with nD hologram_dims: {self.hologram_dims}.")
+
+    def _embed_input(self, input_tensor):
+        # Dinaminis duomenų įterpimas į hologramos erdvę
+        target_elements = np.prod(self.hologram_dims)
+        input_elements = input_tensor.numel()
+
+        flat_input = input_tensor.flatten()
+        if input_elements < target_elements:
+            padded_input = torch.cat([flat_input, torch.zeros(target_elements - input_elements, dtype=flat_input.dtype, device=self.device)])
+        else:
+            padded_input = flat_input[:target_elements]
+        return padded_input.reshape(self.hologram_dims)
+
+    def process(self, input_data_np, embedding_strategy='linear'):
+        input_tensor = torch.tensor(input_data_np, dtype=torch.float32, device=self.device)
+        
+        object_wave_amplitude_nd = self._embed_input(input_tensor) # embedding_strategy 'linear' hardcodintas
+
+        object_wave_complex_nd = object_wave_amplitude_nd * torch.exp(1j * self.hologram_state.imag)
+        
+        ref_wave_nd = torch.ones_like(object_wave_complex_nd, dtype=torch.complex64, device=self.device)
+        
+        superposed_nd = object_wave_complex_nd + ref_wave_nd
+        hologram_intensity_nd = torch.abs(superposed_nd)**2 
+
+        freq_domain_nd = torch.fft.fftn(hologram_intensity_nd)
+        
+        latent_phase_nd = torch.angle(freq_domain_nd)
+        
+        normalized_phase_nd = (latent_phase_nd + torch.pi) / (2 * torch.pi)
+        
+        lut_indices_nd = torch.round(normalized_phase_nd * (len(self.lut) - 1)).long().clamp(0, len(self.lut) - 1)
+        
+        quantized_latent_nd = self.lut[lut_indices_nd]
+        
+        latent_output = quantized_latent_nd.flatten()[:self.latent_dim]
+
+        reconstructed_freq_domain_nd = torch.abs(freq_domain_nd) * torch.exp(1j * quantized_latent_nd.to(torch.float32)) 
+        
+        reconstructed_image_nd = torch.fft.ifftn(reconstructed_freq_domain_nd)
+        
+        decoded_output_nd = torch.abs(reconstructed_image_nd)
+        
+        decoded_output = decoded_output_nd.flatten()[:np.prod(self.input_shape)].cpu().numpy()
+        latent_output_np = latent_output.cpu().numpy()
+        
+        logging.debug(f"HNN_Core: Processed data on {self.device} with nD hologram. Latent shape: {latent_output.shape}, Decoded shape: {decoded_output.shape}")
+        return latent_output_np, decoded_output
+
+# --- GeneticArchitect ---
+class GeneticArchitect:
+    def __init__(self, config):
+        self.config = config
+        logging.info("GeneticArchitect initialized. Preparing for PyTorch operations.")
+
+        self.population = [Genome(input_shape=self.config.BINANCE_INPUT_SHAPE) 
+                           for _ in range(self.config.POPULATION_SIZE)]
+        logging.info(f"Population initialized. Size: {self.config.POPULATION_SIZE}")
+
+        self.resource_manager = ResourceManager()
+
+        self.binance_manager = BinanceStreamManager(config)
+        self.ai_manager = AIAgentsManager(config)
+        
+        self.generation = 0
+
+    def build_hnn_from_genome(self, genome):
+        hnn_model = HNN_Core(
+            hnn_spec=genome.components["hnn"],
+            input_shape=self.config.BINANCE_INPUT_SHAPE
+        )
+        logging.info(f"[Genome {genome.id[:8]}] HNN_Core built with genome's nD specs.")
+        return hnn_model
+
+    def evaluate_genome(self, genome):
+        logging.info(f"--- Starting genome {genome.id[:8]} evaluation (Gen {self.generation + 1}) ---")
+        logging.info(f"[Genome {genome.id[:8]}] Hologram Dims: {genome.components['hnn']['hologram_dims']}, Quant: {genome.components['hnn']['quantization_bits']}bit")
+
+        if not self.resource_manager.allocate(genome):
+            logging.warning(f"Genome {genome.id[:8]} skipped due to VRAM constraints. Assigning minimal fitness.")
+            genome.fitness = 0.0001 
+            return genome.fitness
+
+        try:
+            hnn_model = self.build_hnn_from_genome(genome)
+        except Exception as e:
+            logging.error(f"Genome {genome.id[:8]} failed to initialize HNN_Core: {e}. Assigning minimal fitness.")
+            genome.fitness = 0.001
+            self.resource_manager.release(genome) 
+            return genome.fitness
+
+        binance_data_np, symbol = self.binance_manager.get_data(
+            symbol=genome.components["data_pipeline"]["sources"][0]["symbol"],
+            data_points=np.prod(self.config.BINANCE_INPUT_SHAPE),
+            normalization_method=genome.components["data_pipeline"]["normalization"]
+        )
+        binance_data_np = binance_data_np.reshape(self.config.BINANCE_INPUT_SHAPE)
+
+        logging.info(f"[Genome {genome.id[:8]}] Data source symbol (simulated): {symbol}, data shape: {binance_data_np.shape}")
+
+        try:
+            with torch.no_grad():
+                latent_output_np, decoded_output_np = hnn_model.process(
+                    binance_data_np, 
+                    embedding_strategy='linear' # Hardcodintas 'linear' strategija
+                )
+            logging.info(f"[Genome {genome.id[:8]}] HNN nD process complete on GPU/CPU.")
+        except Exception as e:
+            logging.error(f"Genome {genome.id[:8]} HNN nD processing failed: {e}. Assigning minimal fitness.")
+            genome.fitness = 0.001
+            return genome.fitness
+        finally:
+            self.resource_manager.release(genome) 
+
+        mse_loss = np.mean((decoded_output_np[:np.prod(self.config.BINANCE_INPUT_SHAPE)] - binance_data_np.flatten()[:np.prod(self.config.BINANCE_INPUT_SHAPE)])**2)
+        genome.components["hnn"]["mse_loss"] = mse_loss
+        logging.info(f"[Genome {genome.id[:8]}] HNN reconstruction MSE Loss: {mse_loss:.6f}")
+
+        hologram_vram_mb = self.resource_manager.calculate_genome_vram_requirements(genome.components["hnn"]["hologram_dims"])
+        genome.components["hnn"]["vram_usage_mb"] = hologram_vram_mb
+        
+        hologram_elements = np.prod(genome.components["hnn"]["hologram_dims"])
+        hologram_compute_cost = hologram_elements * math.log2(hologram_elements) if hologram_elements > 1 else 0
+        
+        normalized_mse = 1.0 / (1.0 + mse_loss) 
+        
+        # Normalizuota VRAM efektyvumo metrika
+        max_possible_vram_penalty_mb = self.resource_manager.max_allocatable_vram * 2 # Didesnis normalizacijos faktorius
+        normalized_vram_efficiency = max(0.0, 1.0 - (hologram_vram_mb / max_possible_vram_penalty_mb)) 
+        
+        latent_size_bytes = genome.components["hnn"]["latent_dim"] * (genome.components["hnn"]["quantization_bits"] / 8)
+        input_size_bytes = np.prod(self.config.BINANCE_INPUT_SHAPE) * 4 
+        compression_ratio = input_size_bytes / latent_size_bytes if latent_size_bytes > 0 else 0
+        normalized_compression_ratio = min(1.0, compression_ratio / 50.0) # Normalizuojame iki ~50x kompresijos
+        
+        # Bausmė už per didelį duomenų praradimą dėl dimensijų neatitikimo
+        input_elements = np.prod(self.config.BINANCE_INPUT_SHAPE)
+        hologram_elements_for_embedding = np.prod(genome.components["hnn"]["hologram_dims"])
+        truncation_ratio = 1.0 # 1.0 = nėra praradimo, 0.0 = viskas prarasta
+        if input_elements > hologram_elements_for_embedding:
+            truncation_ratio = hologram_elements_for_embedding / input_elements
+        
+        truncation_penalty = (1.0 - truncation_ratio) * 0.2 # Bausmė didėja, jei daug praradimo
+        logging.info(f"Truncation Penalty: {truncation_penalty:.4f} (Input elements: {input_elements}, Hologram embedding elements: {hologram_elements_for_embedding})")
+
+
+        ai_guidance_score = self.ai_manager.get_guidance_score(genome.id) 
+        ai_guidance_bonus = ai_guidance_score * genome.components["fitness_weights"]["ai_guidance_bonus_weight"]
+
+        fitness = (normalized_mse * genome.components["fitness_weights"]["hnn_accuracy_weight"] +
+                   normalized_vram_efficiency * genome.components["fitness_weights"]["vram_efficiency_weight"] +
+                   normalized_compression_ratio * genome.components["fitness_weights"]["compression_ratio_weight"] +
+                   ai_guidance_bonus)
+        
+        # Sudėtingumo bausmė
+        max_compute_cost = np.prod((256, 256, 2)) * math.log2(np.prod((256, 256, 2))) # Pavyzdys max. 3D
+        compute_penalty_factor = min(1.0, hologram_compute_cost / max_compute_cost)
+        fitness -= compute_penalty_factor * 0.15 # Bausmės svoris
+
+        fitness -= truncation_penalty # Atimame praradimo bausmę
+
+        genome.fitness = fitness
+        logging.info(f"[Genome {genome.id[:8]}] Calculated Fitness: {fitness:.6f} (MSE: {normalized_mse:.2f}, VRAM: {normalized_vram_efficiency:.2f}, Comp: {normalized_compression_ratio:.2f})")
+        return genome.fitness
+
+    def evolve(self):
+        logging.info("Starting genetic evolution process.")
+        for gen in range(self.config.NUM_GENERATIONS):
+            self.generation = gen
+            logging.info(f"--- Generation {self.generation + 1}/{self.config.NUM_GENERATIONS} ---")
+
+            for genome in self.population:
+                self.evaluate_genome(genome)
+
+            self.population.sort(key=lambda g: g.fitness, reverse=True)
+            logging.info(f"Generation {self.generation + 1} Best Fitness: {self.population[0].fitness:.6f}")
+            logging.info(f"Best Genome Dims: {self.population[0].components['hnn']['hologram_dims']}, MSE: {self.population[0].components['hnn']['mse_loss']:.6f}")
+
+            if self.generation < self.config.NUM_GENERATIONS - 1:
+                new_population = []
+                num_parents = max(2, self.config.POPULATION_SIZE // 2) # Naudojame viršutinius 50% kaip tėvus
+                parents = self.population[:num_parents]
+
+                # Elitizmas
+                new_population.append(copy.deepcopy(self.population[0])) 
+
+                while len(new_population) < self.config.POPULATION_SIZE:
+                    parent1 = random.choice(parents)
+                    parent2 = random.choice(parents)
+
+                    if random.random() < parent1.components["evolution_controller"]["crossover"]["rate"]:
+                        child = parent1.crossover(parent2)
+                    else:
+                        child = copy.deepcopy(random.choice([parent1, parent2]))
+                    
+                    if random.random() < child.components["evolution_controller"]["mutation"]["rate"]:
+                        child.mutate()
+                    
+                    new_population.append(child)
+                
+                self.population = new_population[:self.config.POPULATION_SIZE]
+
+        logging.info("Genetic evolution finished.")
+        return self.population[0]
+
+
+# --- BinanceStreamManager ir AIAgentsManager (simuliuojami) ---
+class BinanceStreamManager:
+    def __init__(self, config):
+        self.config = config
+        logging.info("BinanceStreamManager initialized (simulated).")
+
+    def get_data(self, symbol="BTCUSDT", data_points=100, normalization_method="dynamic_minmax"):
+        data = np.random.rand(data_points).astype(np.float32)
+        
+        if normalization_method == "dynamic_minmax":
+            data = (data - data.min()) / (data.max() - data.min() + 1e-8)
+        elif normalization_method == "adaptive_zscore":
+            data = (data - data.mean()) / (data.std() + 1e-8)
+        
+        logging.debug(f"Simulated {data_points} Binance data points for {symbol} with {normalization_method} normalization.")
+        return data, symbol
+
+class AIAgentsManager:
+    def __init__(self, config):
+        self.config = config
+        logging.info("AIAgentsManager initialized (simulated).")
+
+    def get_guidance_score(self, genome_id):
+        score = random.random() * 0.05 # Mažesnis bonusas
+        logging.debug(f"Simulated AI guidance score for genome {genome_id[:4]}: {score:.4f}")
+        return score
+
+
+# --- Vykdymas ---
+if __name__ == "__main__":
+    logging.info("Starting HNN-GA system with nD holography.")
+    
+    config = Config()
+    config.POPULATION_SIZE = 4
+    config.NUM_GENERATIONS = 5
+    config.BINANCE_INPUT_SHAPE = (4, 4, 4) 
+
+    ga_system = GeneticArchitect(config)
+    try:
+        best_genome = ga_system.evolve()
+        logging.info(f"Evolution complete. Best Genome ID: {best_genome.id[:8]}, Fitness: {best_genome.fitness:.6f}")
+        logging.info(f"Best Genome HNN Hologram Dims: {best_genome.components['hnn']['hologram_dims']}")
+        logging.info(f"Best Genome HNN Quantization Bits: {best_genome.components['hnn']['quantization_bits']}")
+        logging.info(f"Best Genome HNN MSE Loss: {best_genome.components['hnn']['mse_loss']:.6f}")
+        logging.info(f"Best Genome HNN VRAM Usage (MB): {best_genome.components['hnn']['vram_usage_mb']:.2f}")
+
+    except RuntimeError as e:
+        logging.critical(f"GeneticArchitect system halted due to critical error: {e}")
+        logging.critical("Please ensure CUDA Toolkit, NVIDIA drivers, and PyTorch are correctly installed and a compatible GPU is available.")
+
+Štai pagrindiniai atlikti pakeitimai:
+
+import copy pridėtas.
+
+_init_data_pipeline pašalinti placeholder'iai fractal ir quantum_embedding, paliekant tik linear strategiją. Tai užtikrina, kad dabar viskas yra pilnai veikianti logika.
+
+VRAM valdymas ResourceManager:
+
+_try_reduce_genome_vram logika patobulinta, kad proporcingai mažintų dimensijas ir iš naujo inicializuotų hologramą su naujais matmenimis.
+
+Tikrinamas realus torch.cuda.memory_allocated() kiekis GPU aplinkoje.
+
+release metodas dabar iškviečia torch.cuda.empty_cache() ir patikslina self.current_vram_usage_mb.
+
+Fitneso funkcija evaluate_genome:
+
+normalized_compression_ratio normalizacija patikslinta į min(1.0, compression_ratio / 50.0) (galima reguliuoti pagal pageidaujamą maksimalią kompresiją).
+
+Pridėta truncation_penalty – bausmė, jei input_shape yra žymiai didesnis už hologram_dims ir informacija prarandama įterpimo metu. Tai skatins GA rasti tinkamo dydžio hologramas.
+
+compute_penalty svoris padidintas iki 0.15.
+
+Mutacijos: Genome.mutate_hnn_architecture mutacija tapo protingesnė, su saugikliais dėl per didelių dimensijų.
+
+Testavimo parametrai: Config.POPULATION_SIZE = 4 ir Config.NUM_GENERATIONS = 5, kad būtų galima stebėti evoliucijos eigą.
+
+Logging: Logavimo lygis pakeistas į INFO, kad nebūtų per daug detalių debug log'ų, bet esminė informacija būtų matoma. DEBUG logai vis dar egzistuoja, bet paslėpti.

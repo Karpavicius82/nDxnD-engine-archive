@@ -1,0 +1,720 @@
+import uuid
+import random
+import math
+import logging
+from typing import Dict, Any, List, Tuple
+
+# Konfigūracijos nustatymas pramoniniam lygiui.
+# Naudosime atskirą konfigūracijos klasę, o ne tiesioginius kintamuosius.
+# Ateityje galima įkelti iš YAML/JSON failų.
+
+class Config:
+    """
+    Sistemos konfigūracijos parametrai. Visi pramoninio lygio nustatymai.
+    """
+    # Sistemos pagrindiniai nustatymai
+    POPULATION_SIZE: int = 20
+    NUM_GENERATIONS: int = 100
+    HOLOGRAPHIC_ENCODING_LATENT_DIM: int = 256 # Tenzoriaus dydis (pvz., 256x4x4x4)
+    BINANCE_DATA_POINTS: int = 100 # Kiek paskutinių taškų naudojama hologramos atnaujinimui
+    VRAM_LIMIT_MB: int = 1800 # GTX960M 2GB - 200MB rezervas sistemai
+    STRESS_THRESHOLD: float = 0.7 # Slenkstis, virš kurio sistema laikoma "stresine"
+    ERROR_RETRY_COUNT: int = 3 # Kiek kartų bandyti pakartotinai API kvietimus
+
+    # Genetinio algoritmo nustatymai
+    MUTATION_RATE_BASE: float = 0.15 # Bazinė mutacijos tikimybė
+    MUTATION_RATE_STRESS_MULTIPLIER: float = 1.5 # Kiek padidėja mutacija esant stresui
+    CROSSOVER_RATE: float = 0.7 # Kryžminimo tikimybė
+    TOURNAMENT_SIZE: int = 3 # Turnyro atrankos dydis
+
+    # AI API nustatymai (ateityje, dabar tik pavyzdys)
+    AI_API_TIMEOUT_SEC: int = 30
+    AI_QUERY_CHANCE_BASE: float = 0.05 # Tikimybė kviesti AI agentus per evoliucijos ciklą
+    
+    # Kvantavimo optimalus taškas (nuo 4 iki 16 bitų)
+    OPTIMAL_QUANTIZATION_BITS: int = 8
+
+    # Ribos genomo laukams (kad mutacijos neišeitų už protingų ribų)
+    GENOME_BOUNDS: Dict[str, Tuple[float, float]] = {
+        "quantization_bits": (4, 16),
+        "hologram_density_factor": (0.1, 1.0),
+        "api_query_frequency_modifier": (0.1, 2.0),
+        "ai_model_params.temperature": (0.1, 1.0),
+        "ai_model_params.max_tokens": (50, 500),
+        "ai_model_params.top_p": (0.0, 1.0),
+        "nn_architecture.out_features.min_dynamic_size": (64, 1024),
+        "nn_architecture.out_features.max_dynamic_size": (128, 2048),
+        "nn_architecture.dropout_p": (0.05, 0.5),
+    }
+
+    # Fitneso komponentų numatytieji svoriai (suma turi būti 1.0)
+    # GA gali šiuos svorius evoliucionuoti!
+    DEFAULT_FITNESS_WEIGHTS: Dict[str, float] = {
+        "base": 0.1,
+        "ai_boost": 0.2,
+        "hologram_accuracy": 0.3,
+        "entropy_stability": 0.1,
+        "stress_penalty": 0.2,
+        "resource_efficiency": 0.1,
+        "quantization_impact": 0.05,
+        "vram_usage_penalty": 0.05, # Papildomas svoris už VRAM viršijimą
+    }
+    
+    # Logavimo nustatymai
+    LOG_LEVEL: str = "INFO" # DEBUG, INFO, WARNING, ERROR, CRITICAL
+    LOG_FILE: str = "genetic_architect.log"
+
+    def __init__(self):
+        # Užtikriname, kad fitneso svorių suma būtų 1.0
+        total_weights = sum(self.DEFAULT_FITNESS_WEIGHTS.values())
+        if not math.isclose(total_weights, 1.0):
+            logging.warning(
+                f"Numatytųjų fitneso svorių suma ({total_weights}) nėra 1.0. Normalizuojama."
+            )
+            for key in self.DEFAULT_FITNESS_WEIGHTS:
+                self.DEFAULT_FITNESS_WEIGHTS[key] /= total_weights
+
+# Nustatome logavimą
+logging.basicConfig(level=getattr(logging, Config.LOG_LEVEL),
+                    format='%(asctime)s - %(levelname)s - %(message)s',
+                    handlers=[
+                        logging.FileHandler(Config.LOG_FILE),
+                        logging.StreamHandler()
+                    ])
+
+---
+
+class Genome:
+    """
+    Atspindi vieną GeneticArchitect sistemos konfigūraciją.
+    Ši klasė apibrėžia genomo struktūrą ir numatytąsias vertes.
+    """
+    def __init__(self,
+                 id: str = None,
+                 fitness: float = 0.0,
+                 generation_evaluated: int = -1,
+                 lut_update_strategy: str = "delta", # Hologramos atnaujinimo strategija
+                 quantization_bits: int = Config.OPTIMAL_QUANTIZATION_BITS, # Kvantavimo bitai
+                 hologram_density_factor: float = 0.5, # Atnaujinimo alfa hologramos kodavime
+                 api_query_frequency_modifier: float = 1.0, # AI kvietimo tikimybės daugiklis
+                 ai_model_params: Dict[str, Any] = None, # AI modelio parametrai
+                 nn_architecture: List[Dict[str, Any]] = None, # NN architektūros aprašymas
+                 fitness_weights: Dict[str, float] = None # Fitneso komponentų svoriai
+                 ):
+        
+        self.id = id if id is not None else str(uuid.uuid4())
+        self.fitness = fitness
+        self.generation_evaluated = generation_evaluated
+        
+        # Pagrindiniai sistemos parametrai
+        self.lut_update_strategy = lut_update_strategy
+        self.quantization_bits = quantization_bits
+        self.hologram_density_factor = hologram_density_factor
+        self.api_query_frequency_modifier = api_query_frequency_modifier
+
+        # AI modelio parametrai
+        self.ai_model_params = ai_model_params if ai_model_params is not None else {
+            "temperature": 0.7,
+            "max_tokens": 200,
+            "top_p": 0.95
+        }
+        
+        # Neuroninio tinklo architektūra (encoderio/decoderio stubas)
+        # Numatoma minimali architektūra, kuri bus evoliucionuojama
+        self.nn_architecture = nn_architecture if nn_architecture is not None else self._default_nn_architecture()
+        
+        # Fitneso komponentų svoriai, kuriuos GA gali evoliucionuoti
+        self.fitness_weights = fitness_weights if fitness_weights is not None else Config.DEFAULT_FITNESS_WEIGHTS.copy()
+        
+        self._validate_genome()
+
+    def _default_nn_architecture(self) -> List[Dict[str, Any]]:
+        """Grąžina numatytąją, minimalią NN architektūrą."""
+        # Tai yra labai supaprastintas pavyzdys. Realiame kode reikėtų įvesties ir išvesties dimensijų.
+        # Dydis "256*4*4*4" yra latentinis hologramos dydis, kuris bus naudojamas Encoder/Decoder.
+        # Įvesties sluoksnis turėtų atitikti BINANCE_DATA_POINTS (pvz., 100).
+        return [
+            {"type": "linear", "out_features": "dynamic", 
+             "min_dynamic_size": Config.GENOME_BOUNDS["nn_architecture.out_features.min_dynamic_size"][0],
+             "max_dynamic_size": Config.GENOME_BOUNDS["nn_architecture.out_features.max_dynamic_size"][1]},
+            {"type": "activation", "name": "gelu"}, # Moderni aktyvacija
+            {"type": "linear", "out_features": Config.HOLOGRAPHIC_ENCODING_LATENT_DIM * 4 * 4 * 4} # Latentinis hologramos dydis (pvz., 256*4*4*4)
+        ]
+
+    def _validate_genome(self):
+        """Validuoja genomo laukus, užtikrindamas, kad jie atitiktų nustatytas ribas."""
+        
+        # Validacija skaitiniams laukams
+        for field, (min_val, max_val) in Config.GENOME_BOUNDS.items():
+            if "." in field: # Sublaukas, pvz., "ai_model_params.temperature"
+                parts = field.split('.')
+                current_val = self.__dict__[parts[0]]
+                for part in parts[1:]:
+                    if isinstance(current_val, dict):
+                        current_val = current_val.get(part)
+                    else: # If a part of path is not a dict, it's an error in config, but we try to continue
+                        current_val = None 
+                        break
+
+                if current_val is not None:
+                    if not (min_val <= current_val <= max_val):
+                        logging.warning(f"Genomo laukas '{field}' už ribų ({current_val}). Klipuojama.")
+                        self._set_nested_value(self.__dict__, parts, max(min_val, min(max_val, current_val)))
+
+            else: # Top-level fields
+                if hasattr(self, field):
+                    current_val = getattr(self, field)
+                    if isinstance(current_val, (int, float)):
+                        if not (min_val <= current_val <= max_val):
+                            logging.warning(f"Genomo laukas '{field}' už ribų ({current_val}). Klipuojama.")
+                            setattr(self, field, max(min_val, min(max_val, current_val)))
+
+        # NN architektūros validacija
+        if not (2 <= len(self.nn_architecture) <= 10):
+            logging.error(f"NN architektūros sluoksnių skaičius ({len(self.nn_architecture)}) už ribų.")
+            raise ValueError("NN architektūros sluoksnių skaičius už leidžiamų ribų.")
+        
+        # Patikrinti, ar paskutinis sluoksnis yra linear ir tinkamos išvesties dimensijos
+        last_layer = self.nn_architecture[-1]
+        if last_layer["type"] != "linear" or last_layer.get("out_features") != Config.HOLOGRAPHIC_ENCODING_LATENT_DIM * 4 * 4 * 4:
+            logging.error("NN architektūra neturi tinkamo išvesties sluoksnio hologramai.")
+            raise ValueError("NN architektūra neturi tinkamo išvesties sluoksnio hologramai.")
+
+        # Fitneso svorių validacija
+        total_weights = sum(self.fitness_weights.values())
+        if not math.isclose(total_weights, 1.0, rel_tol=1e-5): # Using rel_tol for float comparison
+            logging.warning(f"Fitneso svorių suma ({total_weights}) nėra 1.0. Normalizuojama.")
+            for key in self.fitness_weights:
+                self.fitness_weights[key] /= total_weights
+
+    def _set_nested_value(self, obj, path_parts, value):
+        """Pagalbinė funkcija, nustatanti įdėto žodyno reikšmę."""
+        for i, part in enumerate(path_parts):
+            if i == len(path_parts) - 1:
+                obj[part] = value
+            else:
+                if part not in obj or not isinstance(obj[part], dict):
+                    obj[part] = {} # Create dict if it doesn't exist or is not a dict
+                obj = obj[part]
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Konvertuoja genomą į žodyną, tinkamą serializavimui (pvz., į JSON)."""
+        return {
+            "id": self.id,
+            "fitness": self.fitness,
+            "generation_evaluated": self.generation_evaluated,
+            "lut_update_strategy": self.lut_update_strategy,
+            "quantization_bits": self.quantization_bits,
+            "hologram_density_factor": self.hologram_density_factor,
+            "api_query_frequency_modifier": self.api_query_frequency_modifier,
+            "ai_model_params": self.ai_model_params,
+            "nn_architecture": self.nn_architecture,
+            "fitness_weights": self.fitness_weights
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]):
+        """Kuriamas genomas iš žodyno."""
+        return cls(**data)
+
+
+---
+
+class GeneticOperations:
+    """
+    Tvarko genetinės operacijas: mutaciją ir kryžminimą.
+    """
+    def __init__(self, config: Config):
+        self.config = config
+        self.activation_functions = ["relu", "tanh", "sigmoid", "gelu"]
+        self.nn_layer_types = ["linear", "activation", "dropout"] # conv3d kol kas nepridedame, nes reikia input/output channel logikos.
+
+
+    def mutate(self, genome: Genome, stress_index: float, ai_mutation_intensity_suggestion: float = 1.0):
+        """
+        Mutuoja genomą, atsižvelgiant į konfigūraciją ir sistemos stresą.
+        ai_mutation_intensity_suggestion - iš AI gautas siūlymas (0.5-1.5), kiek padidinti mutacijų intensyvumą.
+        """
+        mutation_rate = self.config.MUTATION_RATE_BASE
+        if stress_index > self.config.STRESS_THRESHOLD:
+            mutation_rate *= self.config.MUTATION_RATE_STRESS_MULTIPLIER
+        mutation_rate *= ai_mutation_intensity_suggestion # AI gali paveikti bendrą mutacijos intensyvumą
+
+        logging.debug(f"Mutuojama: Genomo ID {genome.id}, Mutacijos dažnis: {mutation_rate:.3f}, Stresas: {stress_index:.2f}")
+
+        # Skaitinių laukų mutacija
+        for field, (min_val, max_val) in self.config.GENOME_BOUNDS.items():
+            if random.random() < mutation_rate:
+                if "." in field: # Sublaukas
+                    parts = field.split('.')
+                    current_val = self._get_nested_value(genome.__dict__, parts)
+                    if current_val is not None:
+                        sigma = (max_val - min_val) / 10 # 10% diapazono pločio
+                        mutated_val = current_val + random.gauss(0, sigma)
+                        self._set_nested_value(genome.__dict__, parts, max(min_val, min(max_val, mutated_val)))
+                        logging.debug(f"  Mutavo '{field}': {current_val:.3f} -> {mutated_val:.3f}")
+                else: # Top-level field
+                    if hasattr(genome, field) and isinstance(getattr(genome, field), (int, float)):
+                        current_val = getattr(genome, field)
+                        sigma = (max_val - min_val) / 10
+                        mutated_val = current_val + random.gauss(0, sigma)
+                        setattr(genome, field, max(min_val, min(max_val, mutated_val)))
+                        logging.debug(f"  Mutavo '{field}': {current_val:.3f} -> {mutated_val:.3f}")
+
+        # AI modelio parametrai (jei nebuvo mutuoti per bendrą ciklą)
+        for param_key in genome.ai_model_params:
+            full_path = f"ai_model_params.{param_key}"
+            if random.random() < mutation_rate: # Individuali tikimybė per parametrus
+                bounds = self.config.GENOME_BOUNDS.get(full_path)
+                if bounds:
+                    min_val, max_val = bounds
+                    current_val = genome.ai_model_params[param_key]
+                    sigma = (max_val - min_val) / 10
+                    mutated_val = current_val + random.gauss(0, sigma)
+                    genome.ai_model_params[param_key] = max(min_val, min(max_val, mutated_val))
+                    logging.debug(f"  Mutavo AI param '{param_key}': {current_val:.3f} -> {mutated_val:.3f}")
+
+        # NN architektūros mutacija (struktūrinė mutacija)
+        if random.random() < mutation_rate * 0.5: # Retesnė struktūrinė mutacija
+            self._mutate_nn_architecture(genome)
+            logging.debug("  NN architektūros mutacija įvyko.")
+
+        # Fitneso svorių mutacija
+        if random.random() < mutation_rate: # Individuali tikimybė
+            for weight_key in genome.fitness_weights:
+                if random.random() < 0.3: # Kiekvienas svoris turi savo mutacijos tikimybę
+                    current_weight = genome.fitness_weights[weight_key]
+                    # Maža perturbacija, kad svoriai nesumažėtų iki 0 ar neviršytų 1.0 per daug
+                    mutated_weight = current_weight + random.uniform(-0.05, 0.05)
+                    genome.fitness_weights[weight_key] = max(0.0, min(1.0, mutated_weight)) # Apriboti 0-1
+            # Normalizuoti svorius, kad suma būtų 1.0
+            total_sum = sum(genome.fitness_weights.values())
+            if not math.isclose(total_sum, 1.0, rel_tol=1e-5) and total_sum > 0:
+                for key in genome.fitness_weights:
+                    genome.fitness_weights[key] /= total_sum
+            logging.debug(f"  Mutavo fitneso svoriai: {genome.fitness_weights}")
+        
+        try:
+            genome._validate_genome() # Iš naujo validuojame genomą po mutacijos
+        except ValueError as e:
+            logging.error(f"Mutuotas genomas {genome.id} yra nevalidus: {e}. Reiks atmesti arba pakartoti.")
+            # Pramoniniame lygyje čia galima būtų grąžinti False arba mesti specifinę išimtį,
+            # kad tėvinis procesas galėtų atmesti šį genomą.
+            raise e # Kol kas tiesiog išmetame, kad matytume problemą
+
+    def _mutate_nn_architecture(self, genome: Genome):
+        """Atlieka struktūrines mutacijas neuroninio tinklo architektūrai."""
+        mutation_type = random.choice(["add_layer", "remove_layer", "change_layer"])
+        
+        logging.debug(f"    NN Architektūros mutacijos tipas: {mutation_type}")
+
+        if mutation_type == "add_layer" and len(genome.nn_architecture) < 10:
+            new_layer = self._create_random_nn_layer()
+            insert_idx = random.randint(0, len(genome.nn_architecture) - 1)
+            # Užtikriname, kad nelaužytume encoder/decoder struktūros:
+            # Paskutinis sluoksnis turi būti linear, vedantis į hologramos latentą.
+            # Nepridėti po paskutinio linear sluoksnio.
+            if insert_idx == len(genome.nn_architecture) - 1 and new_layer["type"] != "linear":
+                # Jei pridedam priešpaskutiniame sluoksnyje, ir naujas nėra linear, gali sulaužyti išvestį
+                if random.random() < 0.5: # 50% tikimybė pridėti kaip paskutinį linear, jei tai leistina
+                    insert_idx = len(genome.nn_architecture) - 2 if len(genome.nn_architecture) > 1 else 0
+                else:
+                    return # Nepavyko pridėti saugiai
+
+            genome.nn_architecture.insert(insert_idx, new_layer)
+            logging.debug(f"    Pridėtas naujas sluoksnis {new_layer['type']} indekse {insert_idx}.")
+
+        elif mutation_type == "remove_layer" and len(genome.nn_architecture) > 2:
+            # Negalima pašalinti pirmo ar paskutinio sluoksnio, kad išlaikyti įvesties/išvesties struktūrą.
+            remove_idx = random.randint(0, len(genome.nn_architecture) - 1)
+            if remove_idx != 0 and remove_idx != len(genome.nn_architecture) - 1:
+                del genome.nn_architecture[remove_idx]
+                logging.debug(f"    Pašalintas sluoksnis indekse {remove_idx}.")
+
+        elif mutation_type == "change_layer":
+            # Keisti bet kurį sluoksnį, išskyrus pirmą ir paskutinį (dėl specifikos)
+            if len(genome.nn_architecture) <= 2: return # Nėra ką keisti tarpiniame
+            change_idx = random.randint(0, len(genome.nn_architecture) - 1)
+            # Užtikriname, kad pirmo ir paskutinio sluoksnio nekeičiame drastiškai
+            if change_idx == 0: return # Pirmas sluoksnis yra input layer, jo nekeičiame čia
+            if change_idx == len(genome.nn_architecture) - 1: # Paskutinis yra output layer
+                # Galima tik keisti išvesties dydį, bet mes jo nekeičiame (jis fiksuotas hologramos matmenims)
+                # Todėl šio atveju nieko nedarome
+                return
+
+            layer = genome.nn_architecture[change_idx]
+            if layer["type"] == "linear":
+                if random.random() < 0.5 and layer.get("out_features") == "dynamic":
+                    # Pakeisti dinaminio sluoksnio ribas
+                    min_bound = self.config.GENOME_BOUNDS["nn_architecture.out_features.min_dynamic_size"]
+                    max_bound = self.config.GENOME_BOUNDS["nn_architecture.out_features.max_dynamic_size"]
+                    
+                    layer["min_dynamic_size"] = max(min_bound[0], min(min_bound[1], layer["min_dynamic_size"] + random.randint(-64, 64)))
+                    layer["max_dynamic_size"] = max(max_bound[0], min(max_bound[1], layer["max_dynamic_size"] + random.randint(-128, 128)))
+                    logging.debug(f"    Pakeistas linear sluoksnio dydis indekse {change_idx}.")
+                else: # Galima keisti į kitą tipą, bet atsargiai
+                    # Dabar tik keičiame esamo linear sluoksnio parametrus.
+                    pass 
+            elif layer["type"] == "activation":
+                layer["name"] = random.choice([name for name in self.activation_functions if name != layer["name"]])
+                logging.debug(f"    Pakeista aktyvacijos funkcija indekse {change_idx}.")
+            elif layer["type"] == "dropout":
+                if random.random() < 0.5:
+                    layer["p"] = max(self.config.GENOME_BOUNDS["nn_architecture.dropout_p"][0], 
+                                     min(self.config.GENOME_BOUNDS["nn_architecture.dropout_p"][1], 
+                                         layer["p"] + random.uniform(-0.1, 0.1)))
+                    logging.debug(f"    Pakeistas dropout koeficientas indekse {change_idx}.")
+
+    def _create_random_nn_layer(self) -> Dict[str, Any]:
+        """Sukuria atsitiktinį NN sluoksnį mutacijai."""
+        layer_type = random.choice(self.nn_layer_types)
+        
+        if layer_type == "linear":
+            # Sukuriame dinaminį sluoksnį pagal numatytąsias ribas
+            min_size = self.config.GENOME_BOUNDS["nn_architecture.out_features.min_dynamic_size"][0]
+            max_size = self.config.GENOME_BOUNDS["nn_architecture.out_features.max_dynamic_size"][1]
+            return {"type": "linear", "out_features": "dynamic", 
+                    "min_dynamic_size": random.randint(min_size, max_size // 2),
+                    "max_dynamic_size": random.randint(max_size // 2, max_size)}
+        elif layer_type == "activation":
+            return {"type": "activation", "name": random.choice(self.activation_functions)}
+        elif layer_type == "dropout":
+            return {"type": "dropout", "p": random.uniform(self.config.GENOME_BOUNDS["nn_architecture.dropout_p"][0], self.config.GENOME_BOUNDS["nn_architecture.dropout_p"][1])}
+        return {} # Turėtų nepasiekti
+
+    def crossover(self, parent1: Genome, parent2: Genome) -> Genome:
+        """
+        Atlieka kryžminimą tarp dviejų tėvų genomų, kad sukurtų naują palikuonį.
+        Naudojamas uniform crossover, o NN architektūrai - point crossover.
+        """
+        child_dict = {}
+        
+        # Uniform crossover for most fields
+        for key in parent1.to_dict().keys():
+            if key in ["id", "fitness", "generation_evaluated"]:
+                # Šiuos laukus nustatome naujai palikuoniui
+                continue 
+            
+            if random.random() < self.config.CROSSOVER_RATE:
+                if key == "nn_architecture":
+                    # Specialus kryžminimas architektūrai
+                    child_dict[key] = self._crossover_nn_architecture(parent1.nn_architecture, parent2.nn_architecture)
+                elif key == "ai_model_params" or key == "fitness_weights":
+                    # Kryžminimas viso dikto (arba giliau, jei reikia)
+                    child_dict[key] = random.choice([parent1.to_dict()[key], parent2.to_dict()[key]]).copy()
+                else:
+                    child_dict[key] = random.choice([parent1.to_dict()[key], parent2.to_dict()[key]])
+            else:
+                child_dict[key] = parent1.to_dict()[key] # Jei nekryžminama, paimama iš pirmo tėvo
+
+        child = Genome.from_dict(child_dict)
+        child.id = str(uuid.uuid4()) # Naujas ID palikuoniui
+        child.fitness = 0.0 # Nulinis fitnesas, reiks įvertinti
+        child.generation_evaluated = -1 # Dar neįvertintas
+        
+        try:
+            child._validate_genome() # Validuoja palikuonio genomą
+        except ValueError as e:
+            logging.error(f"Kryžmintas genomas {child.id} yra nevalidus: {e}. Reiks atmesti arba pakartoti.")
+            raise e # Kol kas metame išimtį
+            
+        logging.debug(f"Kryžminimas įvyko: Tėvai {parent1.id}, {parent2.id} -> Vaikas {child.id}")
+        return child
+
+    def _crossover_nn_architecture(self, arch1: List[Dict[str, Any]], arch2: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Atlieka point crossover neuroninio tinklo architektūrai.
+        """
+        min_len = min(len(arch1), len(arch2))
+        max_len = max(len(arch1), len(arch2))
+        
+        # Pasirinkti atsitiktinį kryžminimo tašką, išskyrus galus (įvesties/išvesties sluoksnius)
+        if min_len < 2: # Per trumpi, kad tašką pasirinkti
+            return random.choice([arch1, arch2]).copy() # Tiesiog paimame vieno iš tėvų kopiją
+
+        crossover_point = random.randint(1, min_len - 1) # Taškas tarp 1 ir min_len-1 (nekryžmina pirmą/paskutinį)
+        
+        # Sujungti dalis
+        child_arch = arch1[:crossover_point] + arch2[crossover_point:]
+        
+        # Užtikrinti, kad gautas tinklas turi bent minimalų sluoksnių skaičių ir baigiasi teisingu sluoksniu
+        # (pvz., paskutinis sluoksnis turi būti linear su tinkama išvesties dimensija)
+        if not child_arch or child_arch[-1]["type"] != "linear" or child_arch[-1].get("out_features") != Config.HOLOGRAPHIC_ENCODING_LATENT_DIM * 4 * 4 * 4:
+            # Jei sulaužyta, grąžiname geriausią iš tėvų kopiją (arba atsitiktinį, arba tiesiog pirmą)
+            # Tai yra apsauginis tinklas, realybėje geriau generuoti iki validavimo.
+            logging.warning("NN architektūros kryžminimas sulaužė struktūrą. Grąžinama tėvo kopija.")
+            return random.choice([arch1, arch2]).copy()
+        
+        return [layer.copy() for layer in child_arch] # Grąžinama gili kopija
+
+    def _get_nested_value(self, obj, path_parts):
+        """Pagalbinė funkcija, grąžinanti įdėto žodyno reikšmę."""
+        current = obj
+        for part in path_parts:
+            if isinstance(current, dict) and part in current:
+                current = current[part]
+            else:
+                return None
+        return current
+
+    def _set_nested_value(self, obj, path_parts, value):
+        """Pagalbinė funkcija, nustatanti įdėto žodyno reikšmę."""
+        for i, part in enumerate(path_parts):
+            if i == len(path_parts) - 1:
+                obj[part] = value
+            else:
+                if part not in obj or not isinstance(obj[part], dict):
+                    obj[part] = {}
+                obj = obj[part]
+
+
+---
+
+class GeneticArchitect:
+    """
+    Pagrindinis GeneticArchitect sistemos variklis.
+    Valdo populiacijos evoliuciją.
+    """
+    def __init__(self, config: Config):
+        self.config = config
+        self.genetic_ops = GeneticOperations(config)
+        self.population: List[Genome] = []
+        self.current_generation: int = 0
+        
+        # Čia bus integruoti realūs AI agentai, Binance srautas, Holograma ir t.t.
+        # Dabar tai bus stubs
+        self.hologram_system = None # Pavyzdys: Holograma valdytojas
+        self.binance_data_stream = None # Pavyzdys: Binance WebSocket valdytojas
+        self.ai_agents = None # Pavyzdys: AI agentų klasė
+
+        logging.info("GeneticArchitect inicializuotas.")
+
+    def initialize_population(self):
+        """Inicializuoja pradinę genomų populiaciją."""
+        logging.info(f"Inicializuojama {self.config.POPULATION_SIZE} genomų populiacija.")
+        for _ in range(self.config.POPULATION_SIZE):
+            try:
+                # Kiekvienas genomas inicializuojamas su numatytomis reikšmėmis,
+                # bet vėliau mutuosime, kad gautume įvairovę
+                initial_genome = Genome()
+                # Pirminės populiacijos generavimui galime atlikti keletą mutacijų
+                for _ in range(random.randint(1, 5)): # Atsitiktinis mutacijų skaičius
+                    self.genetic_ops.mutate(initial_genome, stress_index=0.0) # Be streso inicializacija
+                self.population.append(initial_genome)
+            except ValueError as e:
+                logging.error(f"Nepavyko inicializuoti genomo: {e}. Bandoma dar kartą.")
+                continue # Jei nevalidus, bandyti sukurti kitą
+
+
+    def run_evolution(self):
+        """Paleidžia genetinės evoliucijos ciklą."""
+        self.initialize_population()
+
+        for gen in range(self.config.NUM_GENERATIONS):
+            self.current_generation = gen
+            logging.info(f"--- Generacija {gen}/{self.config.NUM_GENERATIONS - 1} ---")
+
+            # 1. Įvertiname populiacijos fitnesą
+            # Šis žingsnis bus patikslintas vėliau, kai bus integruotas visas kontekstas (Holograma, AI, telemetrija)
+            self._evaluate_population()
+
+            # 2. Atranka geriausių individų
+            selected_parents = self._selection()
+
+            # 3. Sukuriame naują populiaciją per kryžminimą ir mutaciją
+            new_population: List[Genome] = []
+            new_population.append(selected_parents[0].copy()) # Elitizmas: išsaugome geriausią genomą
+            
+            # Kuriame palikuonis
+            while len(new_population) < self.config.POPULATION_SIZE:
+                parent1 = random.choice(selected_parents)
+                parent2 = random.choice(selected_parents)
+
+                # Užtikriname, kad tėvai nebūtų identiški (nebent populiacija maža ir nelieka pasirinkimo)
+                if parent1.id == parent2.id and len(selected_parents) > 1:
+                    continue
+
+                try:
+                    child = self.genetic_ops.crossover(parent1, parent2)
+                    self.genetic_ops.mutate(child, stress_index=self._get_current_system_stress()) # Mutuojame vaiką
+                    new_population.append(child)
+                except ValueError as e:
+                    logging.warning(f"Kryžminimas/mutacija nepavyko dėl validacijos klaidos: {e}. Bandome su kitu.")
+                    # Nesiseka sukurti validų vaiką, bandome dar kartą kilpoje
+                    
+            self.population = new_population[:self.config.POPULATION_SIZE] # Apkarpyti iki nustatyto dydžio
+
+            # 4. Logavimas ir telemetrija (stubas)
+            self._log_generation_stats()
+
+            # Galima išsaugoti populiaciją kas N generacijų
+            if gen % 10 == 0:
+                self._save_population_checkpoint()
+
+        logging.info("Evoliucija baigta.")
+        # Grąžiname geriausią genomą
+        self.population.sort(key=lambda g: g.fitness, reverse=True)
+        return self.population[0]
+
+
+    def _evaluate_population(self):
+        """
+        Įvertina kiekvieno genomo fitnesą.
+        Šioje vietoje bus integruoti HNN, AI agentai ir kt. realūs sistemos komponentai.
+        """
+        logging.info(f"  Vertinama populiacija. Dydis: {len(self.population)}")
+        
+        # Pavyzdys, kaip galėtų atrodyti fitneso skaičiavimas:
+        # Realiame scenarijuje, kiekvienas genomas būtų "įdiegtas" ir paleistas.
+        # Jo veikimas stebimas, renkama telemetrija ir tada skaičiuojamas fitnesas.
+
+        # Dabartinis sistemos streso lygis (pavyzdys)
+        # Realiame kode čia būtų dinamiškai gaunamas streso indeksas iš telemetrijos.
+        current_stress_index = self._get_current_system_stress() 
+
+        for genome in self.population:
+            # Stubai realių duomenų, kurie ateitų iš sistemos stebėsenos
+            # Jūsų detalizavimas fitneso funkcijai:
+            # - AI guidance_strength (simuliuojama)
+            # - Hologram reconstruction error (simuliuojama)
+            # - Hologram entropy (simuliuojama)
+            # - Current VRAM usage (simuliuojama)
+            # - Compression ratio (simuliuojama)
+
+            # Simuliuojamos AI įžvalgos (turėtų ateiti iš realių AI agentų)
+            sim_ai_guidance_strength = random.uniform(0.0, 1.0) # Iš AI
+            sim_lut_delta_suggestion = random.uniform(0.5, 1.5) # Iš AI
+            sim_compression_factor_suggestion = random.uniform(0.8, 1.2) # Iš AI
+            sim_mutation_intensity_suggestion = random.uniform(0.8, 1.2) # Iš AI
+
+            # Simuliuojami sistemos veikimo rodikliai
+            sim_reconstruction_error = random.uniform(0.005, 0.5)
+            sim_hologram_entropy = random.uniform(0.1, 0.9)
+            sim_current_vram_usage_mb = random.uniform(500, self.config.VRAM_LIMIT_MB + 500) # Gali viršyti limitą
+            sim_compression_ratio = random.uniform(50.0, 1000.0) # pvz., 200GB / 0.2GB ~ 1000
+
+            # --- Fitneso komponentų skaičiavimas (pagal jūsų specifikaciją) ---
+            components: Dict[str, float] = {}
+
+            # 1. Bazinis fitnesas
+            components["base"] = random.uniform(0.01, 0.1)
+
+            # 2. AI boost
+            components["ai_boost"] = sim_ai_guidance_strength
+
+            # 3. Hologramos tikslumas
+            # 1 / (1 + MSE) – kuo mažesnė klaida, tuo didesnis balas
+            components["hologram_accuracy"] = 1 / (1 + sim_reconstruction_error)
+
+            # 4. Entropijos stabilumas
+            components["entropy_stability"] = (1 - sim_hologram_entropy) # Kuo mažesnė entropija (stabilesnė), tuo didesnis balas
+
+            # 5. Streso bauda
+            components["stress_penalty"] = -current_stress_index # Bauda už stresą
+
+            # 6. Resursų efektyvumas
+            # Čia reikia kruopščiai įvertinti, kas yra "compression_ratio" - ar tai santykis, ar tiesiog tam tikras balas.
+            # Dėl 200GB+ / 2GB VRAM konteksto, šis matmuo yra kritinis.
+            # Pvz., jei ideali kompresija yra 1000x (200GB į 0.2GB), o dabartinė 500x.
+            # Apskaičiavimas, kad būtų aukštesnis balas už geresnę kompresiją:
+            # (current_compression_ratio / max_possible_compression_ratio)
+            # Jei sim_compression_ratio = 1000, max_possible = 1000, tada 1.0.
+            # Jei sim_compression_ratio = 50, tada 0.05.
+            MAX_POSSIBLE_COMPRESSION_RATIO = 1000.0 # Pavyzdys, priklausys nuo konkrečių duomenų ir hologramos efektyvumo
+            components["resource_efficiency"] = sim_compression_ratio / MAX_POSSIBLE_COMPRESSION_RATIO
+            
+            # 7. Kvantavimo poveikis
+            # Optimalu 8 bitai. Kuo arčiau 8, tuo geriau.
+            components["quantization_impact"] = (self.config.OPTIMAL_QUANTIZATION_BITS - abs(genome.quantization_bits - self.config.OPTIMAL_QUANTIZATION_BITS)) / self.config.OPTIMAL_QUANTIZATION_BITS
+
+            # Papildoma bauda, jei VRAM viršija limitą
+            components["vram_usage_penalty"] = 0.0
+            if sim_current_vram_usage_mb > self.config.VRAM_LIMIT_MB:
+                # Bauda proporcinga viršijimui
+                penalty_factor = (sim_current_vram_usage_mb - self.config.VRAM_LIMIT_MB) / 500 # 500 MB viršijimas = 1.0 baudos faktorius
+                components["vram_usage_penalty"] = -penalty_factor 
+                logging.warning(f"  Genomas {genome.id} viršijo VRAM limitą ({sim_current_vram_usage_mb:.2f}MB). Bauda: {penalty_factor:.2f}")
+
+
+            # --- Bendro fitneso apskaičiavimas ---
+            total_fitness = 0.0
+            for key, weight in genome.fitness_weights.items():
+                if key in components:
+                    total_fitness += weight * components[key]
+                else:
+                    logging.warning(f"  Fitneso svorio raktas '{key}' nerastas komponentuose. Patikrinkite konfigūraciją.")
+            
+            # Klipavimas, kad fitnesas būtų tarp 0.001 ir 1.0
+            genome.fitness = max(0.001, min(1.0, total_fitness))
+            genome.generation_evaluated = self.current_generation
+            logging.debug(f"  Genomo {genome.id} fitnesas: {genome.fitness:.4f}")
+
+    def _selection(self) -> List[Genome]:
+        """
+        Atrenka geriausius genomus kitai generacijai naudojant turnyro atranką.
+        """
+        selected: List[Genome] = []
+        for _ in range(self.config.POPULATION_SIZE):
+            competitors = random.sample(self.population, min(self.config.TOURNAMENT_SIZE, len(self.population)))
+            winner = max(competitors, key=lambda g: g.fitness)
+            selected.append(winner)
+        selected.sort(key=lambda g: g.fitness, reverse=True) # Rūšiavimas elitizmui ir tvarkai
+        logging.info(f"  Atrinkta {len(selected)} genomų. Geriausias fitnesas: {selected[0].fitness:.4f}")
+        return selected
+
+    def _get_current_system_stress(self) -> float:
+        """
+        Stubas: Grąžina dabartinį sistemos streso indeksą (0.0-1.0).
+        Realiame kode čia būtų telemetrijos surinkimas iš sistemos (CPU, VRAM, API latencija ir kt.).
+        """
+        # Pavyzdys: Atsitiktinis streso indeksas imitacijai
+        # Realybėje - VRAM naudojimas, CPU apkrova, API atsako laikas, klaidų dažnis
+        return random.uniform(0.0, 1.0)
+
+    def _log_generation_stats(self):
+        """Logina generacijos statistiką."""
+        if not self.population:
+            logging.info("Populiacija tuščia, negalima loginti statistikos.")
+            return
+
+        avg_fitness = sum(g.fitness for g in self.population) / len(self.population)
+        best_genome = max(self.population, key=lambda g: g.fitness)
+        
+        logging.info(f"  Generacija {self.current_generation} statistika:")
+        logging.info(f"    Vidutinis fitnesas: {avg_fitness:.4f}")
+        logging.info(f"    Geriausias fitnesas: {best_genome.fitness:.4f} (ID: {best_genome.id[:8]})")
+        logging.debug(f"    Geriausio genomo kvantavimas: {best_genome.quantization_bits} bitų")
+        logging.debug(f"    Geriausio genomo AI temp: {best_genome.ai_model_params['temperature']:.2f}")
+        logging.debug(f"    Geriausio genomo fitneso svoriai: {best_genome.fitness_weights}")
+        logging.debug(f"    Populiacijos dydis: {len(self.population)}")
+
+    def _save_population_checkpoint(self):
+        """Išsaugo populiacijos būseną (genomų sąrašą) į failą."""
+        # Pramoniniame lygyje tai būtų saugomas į diską (pvz., JSON, Pickle)
+        # Šiuo metu tai yra stubas
+        logging.info(f"Išsaugotas populiacijos taškas generacijai {self.current_generation}.")
+        # data_to_save = [genome.to_dict() for genome in self.population]
+        # with open(f"population_gen_{self.current_generation}.json", "w") as f:
+        #     json.dump(data_to_save, f, indent=2)
+
+# --- Sistemos vykdymas (pavyzdys) ---
+if __name__ == "__main__":
+    logging.info("Pradedamas GeneticArchitect sistemos vykdymas.")
+    
+    # Inicializuojame konfigūraciją
+    config = Config()
+
+    # Sukuriame GeneticArchitect instanciją
+    ga_system = GeneticArchitect(config)
+
+    # Paleidžiame evoliucijos ciklą
+    try:
+        best_overall_genome = ga_system.run_evolution()
+        logging.info(f"Evoliucijos pabaiga. Geriausias bendras genomas (ID: {best_overall_genome.id[:8]}):")
+        logging.info(f"  Fitnesas: {best_overall_genome.fitness:.4f}")
+        logging.info(f"  Kvantavimo bitai: {best_overall_genome.quantization_bits}")
+        logging.info(f"  NN Architektūra: {best_overall_genome.nn_architecture}")
+        logging.info(f"  Fitneso svoriai: {best_overall_genome.fitness_weights}")
+
+    except Exception as e:
+        logging.critical(f"Kritinė klaida vykdymo metu: {e}", exc_info=True)

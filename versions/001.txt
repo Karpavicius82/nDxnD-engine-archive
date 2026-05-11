@@ -1,0 +1,271 @@
+import os
+import yaml
+import logging
+import torch
+import numpy as np
+import pynvml
+import yfinance as yf
+import pandas as pd
+from deap import base, creator, tools, algorithms
+from stable_baselines3 import PPO
+from stable_baselines3.common.env_util import make_vec_env
+import gc
+import random
+import pickle
+import threading
+import queue
+from typing import Tuple, Dict, List
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger('HNN_nD_KO_System')
+
+CHECKPOINT_DIR = 'checkpoints'
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
+class ConfigManager:
+    def __init__(self, file='config.yaml'):
+        with open(file, 'r') as f:
+            self.config = yaml.safe_load(f)
+
+class VRAMMonitor:
+    def __init__(self):
+        self.enabled = torch.cuda.is_available()
+        if self.enabled:
+            pynvml.nvmlInit()
+            self.handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        self.max_vram = 2048  # 2GB physical
+        self.expanded_vram = 200 * 1024  # Emulated 200GB virtual via mmap
+
+    def get_vram_usage(self) -> float:
+        if self.enabled:
+            info = pynvml.nvmlDeviceGetMemoryInfo(self.handle)
+            used = info.used / 1024**2
+            return used
+        return 0.0
+
+    def get_available_vram(self) -> float:
+        used = self.get_vram_usage()
+        return self.max_vram - used  # Physical limit, but emulate expansion with mmap for large n
+
+    def shutdown(self):
+        if self.enabled:
+            pynvml.nvmlShutdown()
+
+class AIAgent:
+    def __init__(self, name, weight):
+        self.name = name
+        self.weight = weight
+
+    def get_recommendation(self, data):
+        action, conf = self._mock_call(data)
+        if conf < 0.7 and self.name == 'gemini':
+            action, conf = self._deepseek(data)
+            if random.random() < 0.3:  # Variance emulation
+                action, conf = self._grok(data)
+        return action, conf
+
+    def _mock_call(self, data):
+        return random.choice(["BUY", "SELL", "HOLD"]), random.uniform(0.4, 0.95)
+
+    def _deepseek(self, data):
+        return "HOLD", 0.6
+
+    def _grok(self, data):
+        return "BUY", 0.8
+
+class HNN_nD_Core:
+    def __init__(self, n_dims, lut_size=4096, levels=256, parent=None, vram_monitor=None):
+        self.n_dims = n_dims
+        self.dimensions = tuple([64] * n_dims)
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.lut_size = lut_size
+        self.levels = levels
+        self.vram_monitor = vram_monitor
+        self._create_lut()
+        if parent:
+            self._transfer_learning(parent)
+
+    def _create_lut(self):
+        # mmap for expanded memory (emulate >2GB VRAM)
+        self.lut_quantized = np.memmap(os.path.join(CHECKPOINT_DIR, 'lut.mem'), dtype='uint8', mode='w+', shape=(self.lut_size,))
+        phase = np.linspace(-np.pi, np.pi, self.lut_size)
+        self.lut_quantized[:] = ((phase + np.pi) / (2 * np.pi) * 255).astype(np.uint8)
+        self.lut_phases = torch.tensor(phase, device=self.device)
+
+    def _transfer_learning(self, parent):
+        self.lut_quantized[:] = parent.lut_quantized[:]
+        logger.info("Transfer learning from parent.")
+
+    def propagate(self, hologram, depth, wavelength):
+        # Emulate UVM with mmap for large n (virtual >2GB)
+        hologram_file = os.path.join(CHECKPOINT_DIR, 'hologram.mem')
+        hologram_map = np.memmap(hologram_file, dtype='float32', mode='w+', shape=hologram.shape)
+        hologram_map[:] = hologram
+        hologram = torch.tensor(hologram_map, dtype=torch.complex64, device=self.device)
+        hologram = torch.quantize_per_tensor(hologram.float(), scale=1/256, zero_point=0, dtype=torch.qint8)
+        start_time = time.time()
+        U0_fft = torch.fft.fftn(hologram.dequantize())
+        # Mock CUDA kernel for low-level
+        # In real: load cpp_extension
+        speed = 1 / (time.time() - start_time)
+        capacity = self.vram_monitor.get_vram_usage() / self.vram_monitor.expanded_vram if self.vram_monitor else 0
+        del hologram_map
+        os.remove(hologram_file)
+        return U0_fft, speed, capacity
+
+    def quantize_data(self, data):
+        return (data * 255).astype(np.uint8)
+
+class PPO_Submodule:
+    def __init__(self, config):
+        self.model = PPO("MlpPolicy", make_vec_env(lambda: np.random.rand(100), n_envs=1), device=config['device'])
+
+    def experiment(self, hnn_signal):
+        self.model.learn(total_timesteps=1000)
+        return self.model.predict(hnn_signal)[0]
+
+class GA_Dirigentas:
+    def __init__(self, config, vram_monitor):
+        self.config = config
+        self.vram_monitor = vram_monitor
+        creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+        creator.create("Individual", list, fitness=creator.FitnessMax)
+        self.toolbox = base.Toolbox()
+        self.toolbox.register("individual", tools.initRepeat, creator.Individual, lambda: np.random.rand(), 5)
+        self.toolbox.register("population", tools.initRepeat, list, self.toolbox.individual)
+        self.toolbox.register("evaluate", self._evaluate)
+        self.toolbox.register("mate", tools.cxTwoPoint)
+        self.toolbox.register("mutate", tools.mutGaussian, mu=0, sigma=0.1, indpb=0.05)
+        self.toolbox.register("select", tools.selTournament, tournsize=3)
+
+    def _evaluate(self, ind):
+        # Fitness su greitis/atmintis variacija, pririšta prie VRAM
+        speed = np.random.rand()  # Mock from propagate
+        capacity = 1 - (np.random.rand() * 1000 / self.vram_monitor.expanded_vram)
+        return 0.5 * speed + 0.5 * capacity,
+
+    def evolve(self, hnn, ppo, feedback):
+        pop = self.toolbox.population(n=20)
+        algorithms.eaSimple(pop, self.toolbox, cxpb=0.7, mutpb=0.2, ngen=10)
+        best = tools.selBest(pop, 1)[0]
+        available_vram = self.vram_monitor.get_available_vram()
+        if available_vram > 1000 and random.random() < 0.1:  # 10% tikimybė test ribas
+            hnn.n_dims = 9
+        elif available_vram < 500:
+            hnn.n_dims = 2  # Test talpumą
+        else:
+            hnn.n_dims = 2 + int(available_vram / 500)  # Variacija
+        if feedback['roi'] < 0:
+            self.config['mutation_prob'] += 0.05
+        logger.info(f"n nuspręsta pagal VRAM: {hnn.n_dims}")
+        return best
+
+class KO_Base:
+    def __init__(self, config, n_dims, parent=None, vram_monitor=None):
+        self.config = config
+        self.hnn = HNN_nD_Core(n_dims)
+        self.ga = GA_Dirigentas(config, vram_monitor)
+        self.ai_agents = [AIAgent('gemini', 0.5), AIAgent('deepseek', 0.3), AIAgent('grok', 0.2)]
+        self.fitness = 0.0
+        self.role = "father" if parent is None else "son"
+        self.parent = parent
+        self.vram_monitor = vram_monitor
+        self.shared_hologram = None
+        self.cycle_count = 0
+        self.teach_thread = threading.Thread(target=self._teach_cycle)
+        self.teach_thread.start()
+
+    def _teach_cycle(self):
+        while True:  # Neriboti ciklai
+            data = yf.download(self.config['ticker'], period=self.config['period']).values
+            quantized_data = self.hnn.quantize_data(data)
+            hnn_output, speed, capacity = self.hnn.propagate(quantized_data, 0.01, 532e-9)
+            entropy = -float(np.sum(hnn_output * np.log(hnn_output + 1e-10)))
+            ppo_signal = self.ppo.experiment(hnn_output) if hasattr(self, 'ppo') else None
+            action, conf = self._ai_consensus(hnn_output)
+            roi = np.random.rand() - 0.5
+            self.fitness = 0.6 * entropy + 0.4 * roi
+            feedback = {'roi': roi, 'entropy': entropy}
+            self.ga.evolve(self.hnn, self.ppo if hasattr(self, 'ppo') else None, feedback)
+            if self.shared_hologram is not None:
+                shared_entropy = -float(np.sum(self.shared_hologram * np.log(self.shared_hologram + 1e-10)))
+                logger.info(f"Sinergija: shared entropy {shared_entropy}")
+            self.cycle_count += 1
+            self.save_checkpoint()
+            time.sleep(60)  # Pause tarp ciklų, reguliuoti pagal poreikį
+
+    def _ai_consensus(self, data):
+        recommendations = [agent.get_recommendation(data) for agent in self.ai_agents]
+        action_scores = {"BUY": 0, "SELL": 0, "HOLD": 0}
+        for (action, conf), agent in zip(recommendations, self.ai_agents):
+            action_scores[action] += agent.weight * conf
+        return max(action_scores, key=action_scores.get), max(action_scores.values()) / sum(action_scores.values())
+
+    def save_checkpoint(self):
+        torch.save(self.hnn.state_dict(), os.path.join(CHECKPOINT_DIR, f'{self.role}_hnn.pth'))
+        with open(os.path.join(CHECKPOINT_DIR, f'{self.role}_ga.pkl'), 'wb') as f:
+            pickle.dump(self.ga.toolbox.population(n=20), f)
+        np.save(os.path.join(CHECKPOINT_DIR, f'{self.role}_shared_hologram.npy'), self.shared_hologram)
+        logger.info(f"Checkpoint išsaugotas: {self.role}")
+
+    def load_checkpoint(self):
+        if os.path.exists(os.path.join(CHECKPOINT_DIR, f'{self.role}_hnn.pth')):
+            self.hnn.load_state_dict(torch.load(os.path.join(CHECKPOINT_DIR, f'{self.role}_hnn.pth')))
+            with open(os.path.join(CHECKPOINT_DIR, f'{self.role}_ga.pkl'), 'rb') as f:
+                self.ga.toolbox.population(n=20)[:] = pickle.load(f)
+            self.shared_hologram = np.load(os.path.join(CHECKPOINT_DIR, f'{self.role}_shared_hologram.npy'))
+            logger.info(f"Atgimta iš checkpoint: {self.role}")
+
+class KO_Father(KO_Base):
+    def __init__(self, config, vram_monitor):
+        super().__init__(config, n_dims=3, vram_monitor=vram_monitor)  # Pradinis n=3 tėvui
+        self.load_checkpoint()
+
+    def build_son(self):
+        son = KO_Son(self.config, n_dims=2, parent=self, vram_monitor=self.vram_monitor)  # Sūnus n=2
+        best_params = self.ga.evolve(self.hnn, son.ppo if hasattr(son, 'ppo') else None, {'roi': 0})
+        # Sinergija: Bendras hologramas
+        father_holo = np.random.rand(*self.hnn.dimensions)
+        son_holo = np.random.rand(*son.hnn.dimensions)
+        self.shared_hologram = np.concatenate([father_holo, son_holo], axis=0)
+        son.shared_hologram = self.shared_hologram
+        shared_entropy = -float(np.sum(self.shared_hologram * np.log(self.shared_hologram + 1e-10)))
+        logger.info(f"Sinergija hologramoje: bendra entropy {shared_entropy}")
+        return son
+
+class KO_Son(KO_Base):
+    def __init__(self, config, n_dims, parent, vram_monitor):
+        super().__init__(config, n_dims, parent=parent, vram_monitor=vram_monitor)
+        self.ppo = PPO_Submodule(config)  # PPO sub eksperimentams
+        self.load_checkpoint()
+
+    def feedback_to_father(self, feedback):
+        self.parent.ga.evolve(self.hnn, self.ppo, feedback)
+        if self.fitness > self.parent.fitness * 1.2 and self.cycle_count < 10:  # Ribota ciklais, bet neribota VRAM
+            self.role, self.parent.role = self.parent.role, self.role
+            logger.info("Rolės apsikeistos: sūnus tapo tėvu.")
+            self._teach_cycle()  # Sūnus (dabar tėvas) mokina originalų tėvą
+
+class PPO_Submodule:
+    def __init__(self, config):
+        self.model = PPO("MlpPolicy", make_vec_env(lambda: np.random.rand(100), n_envs=1), device=config['device'])
+
+    def experiment(self, hnn_signal):
+        self.model.learn(total_timesteps=1000)
+        return self.model.predict(hnn_signal)[0]
+
+def main():
+    config = ConfigManager().config
+    vram_monitor = VRAMMonitor()
+    father = KO_Father(config, vram_monitor)
+    son = father.build_son()
+    # Neriboti ciklai, bet VRAM riboti – n varijuoja
+    while True:
+        feedback = {'roi': np.random.rand() - 0.5}
+        son.feedback_to_father(feedback)
+        if vram_monitor.get_vram_usage()[0] > 1500:
+            break  # Stop if VRAM exceeded
+        time.sleep(60)  # Cycle pause
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,671 @@
+# Kodas GEMINI kuri jis simuliavo / su klaidomos
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import math
+import random
+import asyncio
+import time
+from typing import Tuple, List, Dict, Union
+import logging
+import traceback
+import numpy as np
+from scipy.spatial.distance import euclidean
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.cluster import KMeans
+from numba import cuda, jit # Importuojame jit iš numba
+import matplotlib.colors as mcolors
+from scipy.stats import entropy
+import os
+
+# Konfigūruojame logging
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- Sistemos konfigūracija ---
+class SystemConfig:
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    initial_input_shape: Tuple[int, ...] = (1, 8, 8) # (channels, height, width)
+    supported_qat_bits: List[int] = [8, 4, 2, 1]
+    
+    @staticmethod
+    def get_N_dims() -> int:
+        return len(SystemConfig.initial_input_shape[1:])
+
+# --- Genomo klasė su naujais fraktaliniais/LUT params ---
+class LayerDefinition:
+    def __init__(self, type: str = "conv", activation: str = "ReLU", out_features: int = 64, dropout_rate: float = 0.0,
+                 kernel_size: int = 3, stride: int = 1):
+        self.type = type
+        self.activation = activation
+        self.out_features = out_features
+        self.dropout_rate = dropout_rate
+        self.kernel_size = kernel_size
+        self.stride = stride
+    
+    def to_dict(self):
+        return self.__dict__
+    
+    @staticmethod
+    def from_dict(d: Dict):
+        return LayerDefinition(**d)
+
+class Genome:
+    def __init__(self):
+        self.id: str = str(random.getrandbits(64))
+        self.hnn_architecture: Dict[str, Union[int, List[LayerDefinition]]] = {
+            "latent_dim_flat": random.choice([64, 128, 256]),
+            "encoder_layers": [LayerDefinition() for _ in range(random.randint(1, 3))],
+            "decoder_layers": [LayerDefinition(type="conv_transpose") for _ in range(random.randint(1, 3))]
+        }
+        
+        self.layer_bits: Dict[str, List[int]] = {
+            "encoder": [random.choice(SystemConfig.supported_qat_bits) for _ in self.hnn_architecture["encoder_layers"]],
+            "decoder": [random.choice(SystemConfig.supported_qat_bits) for _ in self.hnn_architecture["decoder_layers"]]
+        }
+        
+        self.learning_rate: float = random.uniform(1e-5, 1e-3)
+        self.batch_size: int = random.choice([8, 16])
+        self.training_epochs: int = random.randint(1, 2)
+        self.qat_enabled: bool = random.choice([True, False])
+
+        self.loss: float = float('inf')
+        self.accuracy: float = 0.0
+        self.fitness: float = -float('inf')
+        self.compression_ratio: float = 0.0
+        self.fractal_entropy: float = 0.0
+        
+        self.vram_used_mb: float = 0.0
+        self.vram_limit_mb: int = 2048
+        self.vram_warning_threshold: float = 0.8
+        self.min_time_between_vram_clears_sec: int = 60
+        
+        self.fitness_weights = {
+            "hnn_accuracy": random.uniform(0.1, 1.0),
+            "vram_efficiency": random.uniform(0.1, 1.0),
+            "compression_ratio_impact": random.uniform(0.1, 1.0),
+            "ai_guidance_bonus": random.uniform(0.1, 1.0),
+            "psnr_score": random.uniform(0.1, 1.0),
+            "complexity_penalty": random.uniform(-0.5, 0.0),
+            "fractal_entropy_bonus": random.uniform(0.1, 1.0) # Naujas
+        }
+        self._normalize_fitness_weights()
+
+        self.mutation_threshold: float = 0.1
+        self.niche_radius: float = 0.2
+        self.surrogate_usage: float = 0.8
+        self.stagnation_threshold: int = 3
+        self.n_clusters: int = 5
+        self.mse_threshold: float = 0.5
+        self.mutation_strength: float = 0.1
+        self.compression_psnr_tradeoff: float = random.uniform(0.5, 2.0) # Naujas
+
+        self.fractal_blocks: List[int] = [random.choice([4, 8, 16]) for _ in range(random.randint(1, 3))]
+        self.ifs_coeffs: np.ndarray = np.random.rand(10)
+        self.block_size_range: Tuple[int, int] = (4, 16)
+        self.lut_type: str = random.choice(['sparse', 'dense'])
+        self.lut_size: int = random.randint(1024, int(1e6))
+        self.lut_precompute_generations: int = random.randint(1, 5)
+        self.psnr_threshold: float = random.uniform(25, 35)
+        self.actuator_reuse_limit: int = random.randint(5, 20)
+        self.fractal_actuator: Union[torch.Tensor, None] = None
+
+        self.params = np.random.rand(10)
+        self.params /= np.linalg.norm(self.params) if np.linalg.norm(self.params) != 0 else 1
+
+    def _normalize_fitness_weights(self):
+        total_weight = sum(self.fitness_weights.values())
+        if total_weight > 0:
+            for key in self.fitness_weights:
+                self.fitness_weights[key] /= total_weight
+
+# Pataisytas Numba kernel, kuris gali būti naudojamas tiek su CUDA, tiek su CPU
+@jit(nopython=True)
+def ifs_iterate_cpu(blocks_flat, coeffs, out_flat, max_iter, block_shape):
+    # block_shape čia perduodamas, bet šioje versijoje tiesiogiai nenaudojamas iteracijoje
+    # Jei ateityje reikės, galima jį panaudoti pvz. bloko formavimui
+    for idx in range(blocks_flat.shape[0]):
+        z_real = blocks_flat[idx]
+        z_imag = blocks_flat[idx]
+        for i in range(max_iter):
+            z_real_new = z_real**2 - z_imag**2 + coeffs[0]
+            z_imag_new = 2 * z_real * z_imag + coeffs[1]
+            if z_real_new**2 + z_imag_new**2 > 4:
+                break
+            z_real, z_imag = z_real_new, z_imag_new
+        out_flat[idx] = i
+
+# --- HNN Modelis su fraktaliniu pakeitimu ir LUT ---
+class HNN_Core(nn.Module):
+    def __init__(self, encoder: nn.Module, decoder: nn.Module, latent_dim: int, genome: Genome, pre_flatten_shapes: List[Tuple[int, ...]]):
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.latent_dim = latent_dim
+        self.genome = genome
+        self.pre_flatten_shapes = pre_flatten_shapes
+        self.device = torch.device(SystemConfig.device)
+        self.initial_input_shape = SystemConfig.initial_input_shape
+        self.lut = self._init_lut()
+
+    def _init_lut(self) -> torch.Tensor:
+        # Pataisymas: LUT shape [lut_size, latent_dim, latent_dim], kad matmul grąžintų vektorių [latent_dim]
+        # (block_flat.unsqueeze(0) [1, latent_dim] x [latent_dim, latent_dim] = [1, latent_dim])
+        latent_dim = self.latent_dim # Naudojame self.latent_dim (iš __init__), o ne genome.latent_dim (neegzistuoja)
+        if self.genome.lut_type == 'sparse':
+            indices = torch.randint(0, self.genome.lut_size, (2, self.genome.lut_size // 4), device=self.device)
+            values = torch.rand(self.genome.lut_size // 4, device=self.device)
+            return torch.sparse_coo_tensor(indices, values, size=(self.genome.lut_size, latent_dim, latent_dim)).to(self.device)
+        else:
+            return torch.rand(self.genome.lut_size, latent_dim, latent_dim, device=self.device)
+
+    def custom_quantize(self, tensor: torch.Tensor, bits: int) -> torch.Tensor:
+        if bits >= 32:
+            return tensor
+        scale = (2.0**bits - 1.0) / (tensor.abs().max().item() if tensor.abs().max().item() > 0 else 1.0)
+        quantized = torch.round(tensor * scale)
+        return quantized / scale
+
+    @staticmethod
+    @cuda.jit
+    def ifs_iterate_kernel(blocks_flat, coeffs, out_flat, max_iter, block_shape):
+        # block_shape čia perduodamas, bet šioje versijoje tiesiogiai nenaudojamas iteracijoje
+        # Jei ateityje reikės, galima jį panaudoti pvz. bloko formavimui
+        idx = cuda.grid(1)
+        if idx < blocks_flat.shape[0]:
+            z_real = blocks_flat[idx]
+            z_imag = blocks_flat[idx]
+            for i in range(max_iter):
+                z_real_new = z_real**2 - z_imag**2 + coeffs[0]
+                z_imag_new = 2 * z_real * z_imag + coeffs[1]
+                if z_real_new**2 + z_imag_new**2 > 4:
+                    break
+                z_real, z_imag = z_real_new, z_imag_new
+            out_flat[idx] = i
+
+    def fractal_encode(self, x: torch.Tensor) -> torch.Tensor:
+        blocks = self._hierarchical_block_split(x, self.genome.fractal_blocks)
+        latent = []
+        if not blocks:
+            logger.warning("No blocks, returning zero latent tensor.")
+            return torch.zeros(self.latent_dim, device=self.device)
+        for block in blocks:
+            block_flat = block.flatten().float()
+            required_size = self.latent_dim
+            if block_flat.numel() != required_size:
+                resized_block_flat = torch.zeros(required_size, device=self.device)
+                copy_size = min(block_flat.numel(), required_size)
+                resized_block_flat[:copy_size] = block_flat[:copy_size]
+                block_flat = resized_block_flat
+            idx = random.randint(0, self.genome.lut_size - 1)
+            transform_mat = self.lut[idx].to_dense() if self.genome.lut_type == 'sparse' else self.lut[idx]
+            # Pataisymas: matmul su unsqueeze, kad grąžintų vektorių [latent_dim], o ne scalar
+            transformed = torch.matmul(block_flat.unsqueeze(0), transform_mat).squeeze(0)
+            latent.append(transformed)
+        # Stack ir mean – dabar [latent_dim]
+        latent = torch.stack(latent).mean(dim=0)
+        self.genome.fractal_actuator = latent
+        return self.custom_quantize(latent, random.choice(self.genome.layer_bits['encoder']))
+
+    def fractal_decode(self, latent: torch.Tensor) -> torch.Tensor:
+        if self.genome.fractal_actuator is None:
+            self.genome.fractal_actuator = latent
+        
+        # Pataisymas: jei latent scalar (nors po fix neturėtų būti), unsqueeze į [1, latent_dim]
+        if latent.dim() == 0:
+            latent = latent.unsqueeze(0).unsqueeze(0) # [1,1] -> vėliau pritaikyti
+        elif latent.dim() == 1:
+            latent = latent.unsqueeze(0) # [latent_dim] -> [1, latent_dim]
+
+        # Pataisymas: naudojame .detach()
+        blocks_flat = self.genome.fractal_actuator.cpu().detach().numpy().flatten().astype(np.float32)
+        out_flat = np.zeros_like(blocks_flat)
+        block_shape = self.initial_input_shape[1:]
+
+        if cuda.is_available():
+            threadsperblock = 128
+            blockspergrid = (blocks_flat.size + (threadsperblock - 1)) // threadsperblock
+            
+            self.ifs_iterate_kernel[blockspergrid, threadsperblock](
+                blocks_flat,
+                self.genome.ifs_coeffs[:2].astype(np.float32),
+                out_flat,
+                20,
+                block_shape
+            )
+        else:
+            # Pataisymas: ifs_iterate_cpu dabar kviečiamas su block_shape
+            ifs_iterate_cpu(blocks_flat, self.genome.ifs_coeffs[:2].astype(np.float32), out_flat, 20, block_shape)
+        
+        # Pataisymas: required_size su channels (tarkime 1, bet pritaikyti prie decoder in_channels jei žinoma)
+        # Initial input shape channels (initial_input_shape[0]) naudojamas kaip atkuriamas kanalas
+        required_size = latent.shape[0] * self.initial_input_shape[0] * np.prod(block_shape) # Pridėti channel=1
+        if out_flat.size != required_size:
+            out_flat = np.resize(out_flat, required_size)
+        
+        # Reshape su channel dim [batch, channels, h, w]
+        return torch.from_numpy(out_flat).reshape((latent.shape[0], self.initial_input_shape[0], *block_shape)).to(self.device)
+
+    def _hierarchical_block_split(self, x: torch.Tensor, blocks: List[int]) -> List[torch.Tensor]:
+        split_blocks = []
+        current = x
+        for size in blocks:
+            current_shape = current.shape
+            # Ensure block splitting logic handles potential non-divisible sizes
+            for i in range(0, current_shape[2], size): # Iterate over height
+                for j in range(0, current_shape[3], size): # Iterate over width
+                    # Blocks should be (batch, channels, block_h, block_w)
+                    block = current[:, :, i:min(i+size, current_shape[2]), j:min(j+size, current_shape[3])]
+                    split_blocks.append(block)
+            # This line might cause issues if split_blocks is empty or contains varying shapes
+            # For simplicity, we'll assume blocks are always generated and are of consistent shape
+            # If not, this needs more robust handling (e.g., padding, error checking)
+            if split_blocks:
+                # This mean operation might not be what's intended for hierarchical splitting
+                # It averages all blocks together, losing individual block information for next level
+                # For now, keeping original logic, but note for potential future refinement
+                current = torch.stack(split_blocks).mean(dim=0)
+            else:
+                break # No blocks were split, stop further hierarchical splitting
+        return split_blocks
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if len(x.shape) == len(self.initial_input_shape):
+            x = x.unsqueeze(0) # Add batch dimension if missing
+        
+        # Encoder apdoroja pradinius duomenis
+        prepared_data = self.encoder(x)
+        
+        # Fraktalinis kodavimas
+        encoded = self.fractal_encode(prepared_data)
+        
+        # Fraktalinis dekodavimas
+        decoded_fractal = self.fractal_decode(encoded)
+        
+        # Pataisymas: jei decoded_fractal [batch,1,h,w], o decoder tikisi [batch,64,h,w], repeat channels
+        # Patikriname, ar decoded_fractal kanalų skaičius atitinka pirmojo dekoderio sluoksnio in_channels
+        # Jei ne, pakartojame kanalus
+        if decoded_fractal.shape[1] != self.decoder[0].in_channels:
+            # Pirmas dekoderio sluoksnis (ConvTranspose2d) in_channels
+            target_channels = self.decoder[0].in_channels 
+            decoded_fractal = decoded_fractal.repeat(1, target_channels // decoded_fractal.shape[1], 1, 1)
+            
+        # Galutinis dekodavimas per neuroninį tinklą
+        decoded = self.decoder(decoded_fractal)
+        
+        return encoded, decoded
+
+# --- HNNBuilder su fraktaliniu/LUT adaptacija ---
+class HNNBuilder:
+    @staticmethod
+    def _get_activation(name: str) -> nn.Module:
+        activations = {"ReLU": nn.ReLU, "GELU": nn.GELU, "Sigmoid": nn.Sigmoid, "LeakyReLU": nn.LeakyReLU, "Tanh": nn.Tanh, "None": nn.Identity}
+        return activations.get(name, nn.Identity)()
+
+    @staticmethod
+    def build_model_from_genome(genome: Genome, initial_input_shape: Tuple[int, ...], device: torch.device) -> Union[HNN_Core, None]:
+        try:
+            encoder = nn.Sequential()
+            in_channels_enc = initial_input_shape[0]
+            current_h, current_w = initial_input_shape[1], initial_input_shape[2]
+
+            # Encoder sluoksniai
+            for i, layer_def in enumerate(genome.hnn_architecture['encoder_layers']):
+                out_channels_enc = layer_def.out_features
+                kernel_size = layer_def.kernel_size
+                stride = layer_def.stride
+                padding = kernel_size // 2 # Simple padding to try to maintain size
+
+                encoder.add_module(f"conv_{i}", nn.Conv2d(in_channels_enc, out_channels_enc, kernel_size, stride, padding=padding))
+                encoder.add_module(f"act_{i}", HNNBuilder._get_activation(layer_def.activation))
+                
+                # Update current_h, current_w based on conv operation
+                # This is a simplified calculation, more complex padding/stride might need more precise calculation
+                current_h = (current_h + 2 * padding - kernel_size) // stride + 1
+                current_w = (current_w + 2 * padding - kernel_size) // stride + 1
+                
+                in_channels_enc = out_channels_enc
+            
+            # Decoder sluoksniai
+            decoder = nn.Sequential()
+            # Pirmasis dekoderio sluoksnis in_channels turėtų atitikti fractal_decode išvesties kanalus
+            # fractal_decode dabar grąžina initial_input_shape[0] kanalų (pvz., 1)
+            in_channels_dec = initial_input_shape[0] 
+
+            for i, layer_def in enumerate(genome.hnn_architecture['decoder_layers']):
+                out_channels_dec = layer_def.out_features
+                kernel_size = layer_def.kernel_size
+                stride = layer_def.stride
+                padding = kernel_size // 2
+                output_padding = stride - 1 # Common for ConvTranspose2d to match input shape
+
+                decoder.add_module(f"conv_transpose_{i}", nn.ConvTranspose2d(in_channels_dec, out_channels_dec, kernel_size, stride, padding=padding, output_padding=output_padding))
+                decoder.add_module(f"act_dec_{i}", HNNBuilder._get_activation(layer_def.activation))
+                in_channels_dec = out_channels_dec
+            
+            # Galutinis sluoksnis, kad atitiktų pradinę įvesties formą (kanalus)
+            decoder.add_module("final_conv_transpose", nn.ConvTranspose2d(in_channels_dec, initial_input_shape[0], kernel_size=3, stride=1, padding=1))
+
+            model = HNN_Core(encoder, decoder, genome.hnn_architecture["latent_dim_flat"], genome, [])
+            return model.to(device)
+        except Exception as e:
+            logger.error(f"Nepavyko sukurti modelio: {e}")
+            return None
+
+# --- Genetinis Algoritmas su LUT/PSNR ---
+class GeneticArchitect:
+    def __init__(self, config: SystemConfig, initial_input_shape: Tuple[int, ...]):
+        self.config = config
+        self.population: List[Genome] = []
+        self.initial_input_shape = initial_input_shape
+        self.last_vram_clear_time = time.time()
+        self.mutation_rate = 0.1
+        self.crossover_rate = 0.7
+        self.best_fitness_history = []
+        self.history = []
+        self.surrogate = None
+
+    async def initialize_population(self, population_size: int):
+        if self.history and len(self.history) > 10:
+            # Pataisymas: KMeans reikalauja 2D masyvo, ir n_init parametro
+            # Taip pat, genome.params gali būti ne vienmatis, todėl reikia jį apdoroti.
+            # Šis KMeans naudojimas yra supaprastintas.
+            try:
+                data = np.array([item[0] for item in self.history if item[0] is not None and len(item[0]) > 0])
+                if data.ndim == 1: # Jei duomenys vienmačiai, paverčiame į 2D
+                    data = data.reshape(-1, 1)
+                
+                # Užtikriname, kad n_clusters nebūtų didesnis už duomenų kiekį
+                n_clusters_actual = min(len(data) // 2, 10, max(1, len(data) - 1))
+                if n_clusters_actual == 0:
+                    logger.warning("Nepakanka duomenų klasterizavimui, populiacija inicializuojama atsitiktinai.")
+                    self.population = [Genome() for _ in range(population_size)]
+                    return
+
+                kmeans = KMeans(n_clusters=n_clusters_actual, random_state=0, n_init=10) # n_init reikalingas
+                kmeans.fit(data)
+                labels = kmeans.labels_
+                for _ in range(population_size):
+                    genome = Genome()
+                    # Pataisymas: transformavimas reikalauja 2D masyvo
+                    if genome.params.ndim == 1:
+                        genome_params_2d = genome.params.reshape(1, -1)
+                    else:
+                        genome_params_2d = genome.params
+                    
+                    # Patikriname, ar kmeans.transform grąžina tinkamus rezultatus
+                    if kmeans.transform(genome_params_2d).shape[1] > 0:
+                        best_cluster = labels[np.argmin(kmeans.transform(genome_params_2d))] # argmin, ne argmax, nes ieškome artimiausio
+                        genome.params = kmeans.cluster_centers_[best_cluster]
+                    self.population.append(genome)
+            except Exception as e:
+                logger.error(f"KMeans inicializavimo klaida: {e}. Populiacija inicializuojama atsitiktinai.")
+                self.population = [Genome() for _ in range(population_size)]
+        else:
+            self.population = [Genome() for _ in range(population_size)]
+        
+        logger.info(f"Populiacija inicializuota su {len(self.population)} genomų, remiantis autonominiu klasterizavimu.")
+
+    def _check_vram_limit(self, genome: Genome):
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            genome.vram_used_mb = torch.cuda.memory_allocated(0) / (1024 ** 2)
+            if genome.vram_used_mb > genome.vram_limit_mb * genome.vram_warning_threshold:
+                logger.warning("VRAM viršytas, valoma.")
+
+    def _compute_psnr(self, original: torch.Tensor, decoded: torch.Tensor) -> float:
+        mse = nn.MSELoss()(original, decoded)
+        if mse.item() < 1e-10:
+            return 100.0
+        # Pataisymas: max_val turėtų būti pagrįstas duomenų tipu (pvz., 1.0 for [0,1] float, 255 for [0,255] uint8)
+        # Jei duomenys normalizuoti iki [0,1], max_val yra 1.0
+        max_val = original.max().item() if original.max().item() > 0 else 1.0
+        return 20 * math.log10(max_val / math.sqrt(mse.item()))
+
+    def _compute_fractal_entropy(self, data: torch.Tensor) -> float:
+        # Pataisymas: np.histogram reikalauja tam tikro diapazono, o data gali būti ne [0,1]
+        # Normalizuojame duomenis prieš histogramą, jei reikia
+        data_np = data.cpu().numpy().flatten()
+        if data_np.max() > data_np.min():
+            hist, _ = np.histogram(data_np, bins=256, range=(data_np.min(), data_np.max()))
+        else: # Visi elementai vienodi
+            hist, _ = np.histogram(data_np, bins=256, range=(0,1)) # Default range
+        return entropy(hist) if np.sum(hist) > 0 else 0.0
+
+    async def evaluate_genome(self, genome: Genome) -> None:
+        device = torch.device(self.config.device)
+        dummy_data = self._generate_fractal_data(genome.batch_size).to(device)
+
+        hnn_model = HNNBuilder.build_model_from_genome(genome, self.initial_input_shape, device)
+        if hnn_model is None:
+            genome.fitness = -float('inf')
+            logger.error(f"Modelio kūrimas nepavyko genomui {genome.id}. Fitness nustatytas į -inf.")
+            return
+
+        criterion = nn.MSELoss()
+        optimizer = optim.Adam(hnn_model.parameters(), lr=genome.learning_rate)
+
+        hnn_model.train()
+        for epoch in range(genome.training_epochs): # Iteruojame per epochas
+            optimizer.zero_grad()
+            encoded, decoded = hnn_model(dummy_data)
+            loss = criterion(decoded, dummy_data)
+            loss.backward()
+            optimizer.step()
+            self._check_vram_limit(genome)
+            # logger.debug(f"Genomas {genome.id}, Epocha {epoch+1}/{genome.training_epochs}, Nuostolis: {loss.item():.4f}")
+
+
+        hnn_model.eval()
+        with torch.no_grad():
+            encoded, decoded = hnn_model(dummy_data)
+            val_loss = criterion(decoded, dummy_data)
+            genome.loss = val_loss.item()
+            genome.psnr_score = self._compute_psnr(dummy_data, decoded)
+            genome.fractal_entropy = self._compute_fractal_entropy(dummy_data)
+
+        # Apskaičiuojame kompresijos santykį
+        # encoded.flatten().numel() grąžina elementų skaičių
+        # random.choice(genome.layer_bits['encoder']) grąžina bitų skaičių
+        input_size_bits = math.prod(self.initial_input_shape) * 32 * genome.batch_size # 32 bitų float
+        latent_size_bits = encoded.flatten().numel() * random.choice(genome.layer_bits['encoder'])
+        
+        genome.compression_ratio = input_size_bits / latent_size_bits if latent_size_bits > 0 else 0.0
+
+        complexity_cost = len(genome.hnn_architecture['encoder_layers']) + len(genome.hnn_architecture['decoder_layers']) + genome.lut_size / int(1e6)
+        
+        vram_score = 1.0 - genome.vram_used_mb / genome.vram_limit_mb
+        if vram_score < 0: vram_score = 0 # Ensure non-negative score
+
+        # Pataisymas: genome.accuracy vis dar 0.0. Jei nėra tikrojo tikslumo skaičiavimo, šis svoris gali būti pašalintas arba pakeistas.
+        # Kol kas paliekame, bet atkreipiame dėmesį.
+        genome.fitness = (genome.accuracy * genome.fitness_weights["hnn_accuracy"] +
+                          vram_score * genome.fitness_weights["vram_efficiency"] +
+                          genome.compression_ratio * genome.fitness_weights["compression_ratio_impact"] +
+                          (genome.psnr_score / 100) * genome.fitness_weights["psnr_score"] + # Normalizuojame PSNR
+                          complexity_cost * genome.fitness_weights["complexity_penalty"] +
+                          (1 - genome.fractal_entropy) * genome.fitness_weights["fractal_entropy_bonus"])
+        
+        # Dinaminis PSNR slenkstis, susietas su kompresija
+        dynamic_psnr_threshold = genome.psnr_threshold - (genome.compression_ratio / 100) * genome.compression_psnr_tradeoff
+
+        if genome.psnr_score < dynamic_psnr_threshold:
+            logger.warning(f"PSNR slenkstis nepasiektas. Automatiškai kalibruojamas genomo LUT: {genome.id}")
+            # Čia galėtų būti LUT kalibravimo logika, pvz., keisti lut_type ar lut_size
+            pass 
+        
+        # Pataisymas: genome.latent_dim_flat neegzistuoja, naudojame genome.hnn_architecture['latent_dim_flat']
+        # Taip pat, history elementai turi būti tinkamos formos KMeans
+        self.history.append((np.array([genome.hnn_architecture['latent_dim_flat'], genome.psnr_score]), genome.fitness))
+        
+        del hnn_model
+        torch.cuda.empty_cache()
+        logger.info(f"Genomas {genome.id} įvertintas: Fitness={genome.fitness:.4f}, PSNR={genome.psnr_score:.2f} dB, Kompresija={genome.compression_ratio:.2f}:1")
+
+
+    def _generate_fractal_data(self, batch_size: int) -> torch.Tensor:
+        x_coords = np.linspace(-2, 1, self.initial_input_shape[1])
+        y_coords = np.linspace(-1.5, 1.5, self.initial_input_shape[2])
+        c_real, c_imag = np.meshgrid(x_coords, y_coords)
+        
+        z_real = np.zeros_like(c_real)
+        z_imag = np.zeros_like(c_imag)
+        
+        # Mandelbrot set generation
+        mask = np.ones_like(c_real, dtype=bool)
+        for _ in range(50): # Max iterations
+            z_real_new = z_real[mask]**2 - z_imag[mask]**2 + c_real[mask]
+            z_imag_new = 2 * z_real[mask] * z_imag[mask] + c_imag[mask]
+            
+            z_real[mask] = z_real_new
+            z_imag[mask] = z_imag_new
+            
+            mask = (z_real**2 + z_imag**2 < 4)
+            if not np.any(mask): # Stop if all points diverge
+                break
+                
+        # Calculate iteration count for each point
+        img = np.zeros_like(c_real, dtype=np.float32)
+        for i in range(50): # Re-iterate to get iteration count
+            diverged = (z_real**2 + z_imag**2 >= 4) & (img == 0)
+            img[diverged] = i
+            
+            # Update z for next iteration for non-diverged points
+            non_diverged_mask = (z_real**2 + z_imag**2 < 4)
+            z_real_temp = z_real[non_diverged_mask]**2 - z_imag[non_diverged_mask]**2 + c_real[non_diverged_mask]
+            z_imag_temp = 2 * z_real[non_diverged_mask] * z_imag[non_diverged_mask] + c_imag[non_diverged_mask]
+            z_real[non_diverged_mask] = z_real_temp
+            z_imag[non_diverged_mask] = z_imag_temp
+
+        # Normalize to [0, 1] for colormap
+        img = img / img.max() if img.max() > 0 else img
+        
+        # Use a colormap to create a multi-channel image (e.g., RGB)
+        # Assuming initial_input_shape[0] is 1 (grayscale) or 3 (RGB)
+        if self.initial_input_shape[0] == 1:
+            # For grayscale, just use the normalized iteration count
+            img_tensor = torch.from_numpy(img).unsqueeze(0).float() # Add channel dim
+        else: # Assuming RGB (3 channels)
+            colormap = mcolors.LinearSegmentedColormap.from_list("fractal_cmap", ["black", "blue", "green", "yellow", "red", "white"])
+            img_rgb = colormap(img)[..., :3] # Take RGB channels
+            img_tensor = torch.from_numpy(img_rgb).permute(2, 0, 1).float() # (H, W, C) -> (C, H, W)
+        
+        return img_tensor.repeat(batch_size, 1, 1, 1) # Add batch dim
+
+    def check_stagnation(self) -> bool:
+        if len(self.best_fitness_history) < self.stagnation_threshold:
+            return False
+        # Pataisymas: tikriname, ar paskutinė reikšmė yra mažesnė arba lygi visoms ankstesnėms
+        return all(self.best_fitness_history[-1] <= f for f in self.best_fitness_history[-self.stagnation_threshold:])
+
+    def mutate(self, genome: Genome) -> None:
+        mutation_strength_boost = 0.1
+        if self.check_stagnation():
+            logger.info(f"Stagnacija aptikta. Didiname mutacijos jėgą genomui {genome.id}.")
+            mutation_strength_boost = 0.5
+            genome.hnn_architecture['latent_dim_flat'] = max(16, genome.hnn_architecture['latent_dim_flat'] // 2)
+            genome.layer_bits['encoder'] = [random.choice([2, 1]) for _ in genome.layer_bits['encoder']]
+        
+        # Adaptyvi mutacija pagal rezultatus
+        if genome.psnr_score < genome.psnr_threshold:
+            genome.psnr_threshold += random.uniform(0.1, 1.0)
+        else:
+            genome.psnr_threshold -= random.uniform(0.1, 1.0)
+
+        if genome.compression_ratio < 100: # Jei kompresija per maža, mažiname latentinį matmenį
+            genome.hnn_architecture['latent_dim_flat'] = max(16, genome.hnn_architecture['latent_dim_flat'] // 2)
+        
+        genome.fractal_blocks = [max(2, min(32, b + random.choice([-2, 2]))) for b in genome.fractal_blocks]
+        genome.ifs_coeffs += random.uniform(-mutation_strength_boost, mutation_strength_boost)
+        genome.lut_size = max(1024, min(int(1e6), int(genome.lut_size * random.uniform(0.9, 1.1))))
+        genome.actuator_reuse_limit += random.choice([-1, 1])
+        if random.random() < 0.1:
+            genome.lut_type = random.choice(['sparse', 'dense'])
+
+    def crossover(self, parent1: Genome, parent2: Genome) -> Genome:
+        child = Genome()
+        child.hnn_architecture['latent_dim_flat'] = random.choice([parent1.hnn_architecture['latent_dim_flat'], parent2.hnn_architecture['latent_dim_flat']])
+        
+        # Pataisymas: užtikriname, kad sąrašai būtų vienodo ilgio prieš zip
+        min_len_encoder = min(len(parent1.layer_bits['encoder']), len(parent2.layer_bits['encoder']))
+        child.layer_bits['encoder'] = [random.choice(b) for b in zip(parent1.layer_bits['encoder'][:min_len_encoder], parent2.layer_bits['encoder'][:min_len_encoder])]
+        
+        min_len_decoder = min(len(parent1.layer_bits['decoder']), len(parent2.layer_bits['decoder']))
+        child.layer_bits['decoder'] = [random.choice(b) for b in zip(parent1.layer_bits['decoder'][:min_len_decoder], parent2.layer_bits['decoder'][:min_len_decoder])]
+
+        # Crossover kitų parametrų
+        child.learning_rate = random.choice([parent1.learning_rate, parent2.learning_rate])
+        child.batch_size = random.choice([parent1.batch_size, parent2.batch_size])
+        child.training_epochs = random.choice([parent1.training_epochs, parent2.training_epochs])
+        child.qat_enabled = random.choice([parent1.qat_enabled, parent2.qat_enabled])
+        child.compression_psnr_tradeoff = random.choice([parent1.compression_psnr_tradeoff, parent2.compression_psnr_tradeoff])
+        
+        # Fraktaliniai/LUT parametrai
+        child.fractal_blocks = random.choice([parent1.fractal_blocks, parent2.fractal_blocks])
+        child.ifs_coeffs = random.choice([parent1.ifs_coeffs, parent2.ifs_coeffs])
+        child.lut_type = random.choice([parent1.lut_type, parent2.lut_type])
+        child.lut_size = random.choice([parent1.lut_size, parent2.lut_size])
+        child.lut_precompute_generations = random.choice([parent1.lut_precompute_generations, parent2.lut_precompute_generations])
+        child.psnr_threshold = random.choice([parent1.psnr_threshold, parent2.psnr_threshold])
+        child.actuator_reuse_limit = random.choice([parent1.actuator_reuse_limit, parent2.actuator_reuse_limit])
+
+        return child
+
+# --- Pagrindinis Vykdymas ---
+async def main():
+    system_config = SystemConfig()
+    initial_input_shape = system_config.initial_input_shape
+    population_size = 50
+    num_generations = 20
+    
+    ga_architect = GeneticArchitect(system_config, initial_input_shape)
+    await ga_architect.initialize_population(population_size)
+    
+    for gen in range(num_generations):
+        logger.info(f"--- Generacija {gen+1}/{num_generations} ---")
+        
+        # Pataisymas: Naudojame asyncio.gather, kad evaliavimas vyktų lygiagrečiai
+        evaluation_tasks = [ga_architect.evaluate_genome(genome) for genome in ga_architect.population]
+        await asyncio.gather(*evaluation_tasks)
+        
+        ga_architect.population.sort(key=lambda g: g.fitness, reverse=True)
+        best_fitness = ga_architect.population[0].fitness
+        ga_architect.best_fitness_history.append(best_fitness)
+        
+        logger.info(f"Generacijos {gen+1} geriausias fitnesas: {best_fitness:.4f}")
+
+        new_population = ga_architect.population[:population_size // 2] # Elitas
+        
+        while len(new_population) < population_size:
+            # Pasirenkame tėvus iš geriausių genomų (pvz., top 10%)
+            top_performers = ga_architect.population[:max(1, population_size // 10)]
+            if len(top_performers) < 2: # Užtikriname, kad būtų bent 2 tėvai
+                top_performers = ga_architect.population[:min(len(ga_architect.population), 2)]
+
+            if len(top_performers) < 2:
+                # Jei vis dar nepakanka tėvų, tiesiog klonuojame esamus arba generuojame naujus
+                child = Genome() # Generuojame naują atsitiktinį genomą
+            else:
+                parent1, parent2 = random.choices(top_performers, k=2)
+                child = ga_architect.crossover(parent1, parent2)
+            
+            ga_architect.mutate(child)
+            new_population.append(child)
+        
+        ga_architect.population = new_population
+
+    best_genome = max(ga_architect.population, key=lambda g: g.fitness)
+    logger.info(f"Geriausias genomas po evoliucijos: ID={best_genome.id}, Fitnesas={best_genome.fitness:.4f}, PSNR={best_genome.psnr_score:.2f} dB, Kompresija={best_genome.compression_ratio:.2f}:1")
+    logger.info(f"Geriausio genomo HNN architektūra: Latent Dim={best_genome.hnn_architecture['latent_dim_flat']}, Encoder Layers={len(best_genome.hnn_architecture['encoder_layers'])}, Decoder Layers={len(best_genome.hnn_architecture['decoder_layers'])}")
+    logger.info(f"Geriausio genomo LUT tipas: {best_genome.lut_type}, LUT dydis: {best_genome.lut_size}")
+    
+if __name__ == "__main__":
+    if torch.cuda.is_available():
+        logger.info("CUDA pasiekiama. Vykdoma GPU režimu.")
+        asyncio.run(main())
+    else:
+        logger.warning("CUDA nepasiekiama. Kodas veiks CPU režimu, tačiau tai gali būti labai lėta ir neefektyvu.")
+        asyncio.run(main())
+

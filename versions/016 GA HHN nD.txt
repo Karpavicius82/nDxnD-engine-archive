@@ -1,0 +1,68 @@
+Pataisymai reikalingi: pakeisti genome.hnn_architecture į genome.components["hnn"].
+
+---
+
+Puiku! Dabar, kai 2 bitų kompresijos parinktis jau numatyta ir suprasta, pereikime prie **neįgyvendinto (nukelto) funkcionalumo** ir paanalizuokime, ko reikia, kad jis būtų įgyvendintas. Tai leis mums aiškiau pamatyti tolesnės sistemos evoliucijos gaires.
+
+---
+
+### **Neįgyvendintas (Nukeltas) Funkcionalumas ir Reikalingi Žingsniai**
+
+Štai detalesnis paaiškinimas, ko trūksta ir kokie žingsniai reikalingi kiekvienam iš nukeltų funkcionalumų:
+
+---
+
+#### **1. Pažangesni nD Duomenų Įterpimo Metodai**
+
+* **Šiuo metu:** Turime tik **`'linear'`** įterpimo strategiją, kuri tiesiog išlygina įvesties duomenis ir juos padding'ina/cropping'ina iki hologramos matmenų. `'fractal'` ir `'quantum_embedding'` yra tik `placeholder`'iai genomo konfigūracijoje, bet neturi realios logikos.
+
+* **1.1. Fraktalinis Įterpimas (`fractal embedding`)**
+    * **Ko trūksta?** Algoritmo, kuris įterptų duomenis į hologramą naudojant fraktalines transformacijas. Tai reikštų, kad įvesties duomenys būtų koduojami kaip fraktalo parametrai arba generuojami kaip fraktalo dalis, leidžiant efektyviau koduoti pasikartojančias struktūras.
+    * **Reikalingi žingsniai:**
+        1.  **Algoritmo pasirinkimas ir tyrimas:** Reikėtų pasirinkti konkretų fraktalinį metodą (pvz., Iterated Function Systems (IFS), Mandelbrot/Julia rinkinių transformacijos ar kitus), tinkantį duomenų įterpimui.
+        2.  **PyTorch įgyvendinimas:** Parašyti PyTorch modulį ar funkciją, kuri priimtų įvesties tenzorių ir, remdamasi pasirinktu fraktaliniu metodu, generuotų nD tenzorių, atitinkantį `hologram_dims`.
+        3.  **HNN_Core integravimas:** Atnaujinti `HNN_Core._embed_input` metodą, kad jis atpažintų `'fractal'` strategiją ir iškviestų atitinkamą fraktalinio įterpimo logiką.
+        4.  **Mutacijos apibrėžimas:** Genome `mutate_data_pipeline` turėtų turėti galimybę pasirinkti `'fractal'` kaip `embedding_strategy`.
+
+* **1.2. Kvantinis Įterpimas (`quantum_embedding`)**
+    * **Ko trūksta?** Algoritmo, kuris įterptų duomenis naudojant kvantinės mechanikos principus, pavyzdžiui, superpoziciją ar susietumą kvantiniuose bituose (qubits), net jei tai tik imitacija klasikiniame kompiuteryje.
+    * **Reikalingi žingsniai:**
+        1.  **Koncepcijos apibrėžimas:** Tai yra sudėtingiausia dalis. Reikėtų nuspręsti, kokius kvantinius principus imituosime ir kaip jie bus taikomi duomenų kodavimui į nD kompleksinį tenzorių. Tai gali apimti kvantinių vartų imitavimą ar duomenų atvaizdavimą į kvantines būsenas.
+        2.  **PyTorch įgyvendinimas:** Parašyti specializuotą PyTorch modulį, kuris imituotų kvantines operacijas duomenims įterpti. Galbūt tai apimtų unitarinių matricų taikymą ar sudėtingesnes transformacijas.
+        3.  **HNN_Core integravimas:** Atnaujinti `HNN_Core._embed_input`, kad jis palaikytų `'quantum_embedding'` strategiją.
+        4.  **Mutacijos apibrėžimas:** Leisti genetiniai algoritmui rinktis šią strategiją.
+
+---
+
+#### **2. Pažangesnis Kryžminimas su Skirtingomis Dimensijomis**
+
+* **Šiuo metu:** Jei du tėvų genomai turi **skirtingas `hologram_dims`**, vaikas tiesiog paveldi vieno iš tėvų `hologram_state` (naudojant `copy.deepcopy`). Tai yra paprasta, bet ne optimali kryžminimo strategija.
+* **Ko trūksta?** Mechanizmo, kuris leistų "maišyti" hologramų būsenas net tada, kai jų matmenys skiriasi.
+* **Reikalingi žingsniai:**
+    1.  **Suderinamumo nustatymas:** Nuspręsti, ar bus bandoma padidinti/sumažinti mažesnę hologramą iki didesnės, ar ieškoti bendro "vidutinio" matmenų rinkinio.
+    2.  **Interpoliacijos/Projekcijos algoritmas:** Įgyvendinti nD tenzorių interpoliacijos (pvz., trilinearinės ar kitos, naudojant `torch.nn.functional.interpolate` jei galima pritaikyti nD atveju) arba projekcijos algoritmą. Tai leistų transformuoti vieno tėvo hologramą į kito tėvo dimensijas prieš sumuojant ar kitaip apjungiant.
+    3.  **Kryžminimo logikos atnaujinimas:** Modifikuoti `Genome.crossover` metodą, kad jis, esant skirtingoms dimensijoms, pirmiausia atliktų transformaciją, o tik tada sumuotų ar maišytų.
+    4.  **Bausmės/Apdovanojimo sistemos patikslinimas:** Gali prireikti patikslinti fitneso funkciją, kad būtų atsižvelgta į sudėtingumą ar galimą informacijos praradimą, atsirandantį dėl dimensijų transformacijų.
+
+---
+
+#### **3. Realus AI Agentų Integravimas (`AIAgentsManager`)**
+
+* **Šiuo metu:** `AIAgentsManager` yra tiesiog `placeholder` klasė, kuri grąžina atsitiktinį (simuliuotą) balą.
+* **Ko trūksta?** Realios integracijos su išorinėmis AI paslaugomis (pvz., Google Gemini API, OpenAI GPT, ar kitais).
+* **Reikalingi žingsniai:**
+    1.  **API sąveika:** Įdiegti kodą, kuris leistų prisijungti prie pasirinkto AI modelio API ir siųsti užklausas.
+    2.  **Užklausų formavimas:** Nuspręsti, kokia informacija iš genomo bus siunčiama AI agentui (pvz., genomo struktūra, paskutinės kartos fitneso rezultatai, MSE, VRAM naudojimas). AI galėtų būti klausiama "Kokius parametrus vertėtų keisti šioje genomo versijoje, kad pagerėtų fitnesas?" arba "Įvertink šią architektūrą ir pasiūlyk pagerinimų kryptis."
+    3.  **Atsakymų analizė:** Implementuoti logiką, kuri analizuotų AI atsakymus (pvz., natūralios kalbos tekstą) ir paverstų juos kiekybinėmis gairėmis ar balais, kurie galėtų paveikti fitneso funkciją arba tiesiogiai genomo mutacijos tikimybę/intensyvumą.
+    4.  **Saugumas ir sąnaudos:** Atsižvelgti į API raktų valdymą, užklausų limitus ir finansines sąnaudas, susijusias su išorinių AI paslaugų naudojimu.
+    5.  **Bonusų/Bausmių pritaikymas:** Patikslinti `ai_guidance_bonus_weight` ir galbūt įdiegti bausmes, jei AI gairės veda į blogesnius rezultatus.
+
+---
+
+### **Apibendrinimas**
+
+Kaip matote, nukeltas funkcionalumas reikalauja ne tik kodo rašymo, bet ir gilesnių mokslinių tyrimų bei koncepcijų apibrėžimo. Kiekvienas iš šių punktų yra atskiras, sudėtingas projektas, kuris ženkliai praplėstų sistemos galimybes ir sudėtingumą.
+
+Mūsų dabartinė sistema yra tvirtas pagrindas, ant kurio galima statyti šiuos pažangesnius modulius. Prioritetus nustatysime atsižvelgdami į turimus resursus ir norimą sistemos evoliucijos kryptį.
+
+Ar šis detalus neįgyvendinto funkcionalumo planas yra aiškus ir ar turite klausimų dėl kurio nors punkto?

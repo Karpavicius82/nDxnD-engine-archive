@@ -1,0 +1,848 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import random
+import uuid
+import math
+import asyncio
+from dataclasses import dataclass, field
+from typing import List, Dict, Tuple, Optional, Any
+import logging
+import time
+
+# --- Konfigūracija ir Globalūs Nustatymai ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+@dataclass
+class SystemConfig:
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    binance_data_points: int = 256
+    default_vram_limit_mb: int = 8000
+    supported_qat_bits: List[int] = field(default_factory=lambda: [4, 8, 16])
+
+# --- Genomo Apibrėžimas ---
+@dataclass
+class HNNLayer:
+    type: str = field(default_factory=lambda: random.choice(["linear", "conv", "dropout", "batch_norm", "max_pool", "avg_pool"]))
+    out_features: int = field(default_factory=lambda: random.randint(32, 256))
+    activation: str = field(default_factory=lambda: random.choice(["GELU", "ReLU", "Sigmoid", "None", "LeakyReLU", "Tanh"]))
+    dropout_rate: float = field(default_factory=lambda: random.uniform(0.1, 0.5))
+    kernel_size: int = field(default_factory=lambda: random.choice([3, 5]))
+    stride: int = field(default_factory=lambda: random.choice([1, 2]))
+
+@dataclass
+class Genome:
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    parent_ids: Tuple[Optional[str], Optional[str]] = (None, None)
+    generation: int = 0
+    fitness: float = 0.0
+    loss: float = float('inf')
+    accuracy: float = 0.0
+    compression_ratio: float = 0.0
+    vram_used_mb: float = 0.0
+
+    hnn_architecture: Dict[str, Any] = field(default_factory=lambda: {
+        "encoder_layers": [HNNLayer() for _ in range(random.randint(2, 5))],
+        "decoder_layers": [HNNLayer() for _ in range(random.randint(2, 5))],
+        "latent_dim_flat": random.randint(16, 128),
+    })
+
+    layer_bits: Dict[str, List[int]] = field(default_factory=dict)
+    qat_enabled: bool = field(default_factory=lambda: random.choice([True, False]))
+    training_epochs: int = field(default_factory=lambda: random.randint(5, 50))
+    learning_rate: float = field(default_factory=lambda: random.uniform(1e-4, 1e-2))
+    batch_size: int = field(default_factory=lambda: random.choice([32, 64, 128]))
+
+    fitness_weights: Dict[str, float] = field(default_factory=lambda: {
+        "hnn_accuracy": random.uniform(0.1, 1.0),
+        "vram_efficiency": random.uniform(0.1, 1.0),
+        "compression_ratio_impact": random.uniform(0.1, 1.0),
+        "ai_guidance_bonus": random.uniform(0.0, 0.5)
+    })
+    fitness_formula_type: str = field(default_factory=lambda: random.choice(["linear", "exponential", "multiplicative", "quadratic"]))
+
+    vram_limit_mb: int = field(default_factory=lambda: random.randint(2000, 10000))
+    min_time_between_vram_clears_sec: int = field(default_factory=lambda: random.randint(1, 10))
+    vram_warning_threshold: float = field(default_factory=lambda: random.uniform(0.6, 0.95))
+    large_bit_penalty_threshold: int = field(default_factory=lambda: random.randint(64, 256))
+    large_bit_penalty_factor: float = field(default_factory=lambda: random.uniform(0.3, 0.8))
+
+    def __post_init__(self):
+        # Koreguojame sluoksnių parametrus pagal jų tipą
+        for section in ["encoder_layers", "decoder_layers"]:
+            for layer in self.hnn_architecture[section]:
+                if layer.type != "dropout":
+                    layer.dropout_rate = 0.0 # Dropout tik dropout sluoksniams
+                if layer.type not in ["conv", "max_pool", "avg_pool"]:
+                    layer.kernel_size = 1 # kernel_size tik konvoliuciniams/pooling sluoksniams
+                    layer.stride = 1
+                elif layer.kernel_size % 2 == 0: # Užtikriname nelyginį kernel_size konvoliuciniams/pooling
+                    layer.kernel_size = max(3, layer.kernel_size - 1)
+        
+        # Dinaminis bitų inicializavimas
+        # Užtikriname, kad bitų masyvai visada egzistuotų
+        if "encoder" not in self.layer_bits:
+            self.layer_bits["encoder"] = [random.randint(1, 512) for _ in self.hnn_architecture["encoder_layers"]]
+        if "decoder" not in self.layer_bits:
+            self.layer_bits["decoder"] = [random.randint(1, 512) for _ in self.hnn_architecture["decoder_layers"]]
+
+
+# --- HNN Modelis su Dinaminiu Kvantavimu ---
+class HNN_Core(nn.Module):
+    def __init__(self, encoder: nn.Module, decoder: nn.Module, latent_dim: int, genome: Genome, pre_flatten_shape: Tuple[int, int]):
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.latent_dim = latent_dim
+        self.genome = genome
+        self.pre_flatten_shape = pre_flatten_shape
+        self.device = torch.device(SystemConfig.device)
+        self.supported_qat_bits = SystemConfig.supported_qat_bits
+
+    def custom_quantize(self, tensor: torch.Tensor, bits: int) -> torch.Tensor:
+        # Jei QAT įjungtas ir bitai palaikomi, QAT tvarko kvantavimą treniravimo metu
+        if self.training and self.genome.qat_enabled and bits in self.supported_qat_bits:
+            return tensor 
+        
+        # Dideli bitai (>= 16) - simuliuojame su didesnio tikslumo float tipais
+        if bits >= 16:
+            if bits <= 16: return tensor.half() # float16
+            elif bits <= 32: return tensor.float() # float32
+            else: return tensor.double() # float64 (simuliuoja iki 512 bitų)
+
+        # Mažesni bitai (< 16) - min-max quantization
+        try:
+            # Safer tensor clamping
+            clamped_tensor = tensor.detach().clone()
+            if torch.isnan(clamped_tensor).any() or torch.isinf(clamped_tensor).any():
+                clamped_tensor = torch.nan_to_num(clamped_tensor, nan=0.0, posinf=1e5, neginf=-1e5)
+            clamped_tensor = torch.clamp(clamped_tensor, min=-1e5, max=1e5) # Apply reasonable bounds
+
+            min_val = clamped_tensor.min()
+            max_val = clamped_tensor.max()
+
+            if min_val == max_val: # Apsauga nuo nulio intervalo
+                return tensor
+
+            # Pakeisti skaičiavimus į saugesnius
+            # Padidinti dinaminį diapazoną iki (2**bits - 1) diskrečių lygių
+            scale = (max_val - min_val) / (2**bits - 1 + 1e-8) # Pridedame epsilon, kad išvengtume dalybos iš nulio
+            
+            # Kvantavimas: suapvalinimas iki artimiausio sveikojo skaičiaus ir apribojimas diapazone
+            # .clamp() dabar pritaikytas iškart
+            q_tensor = torch.round((tensor - min_val) / scale).clamp(0, 2**bits - 1)
+            
+            # Dekvantavimas: grąžinimas į pradinę skalę
+            return q_tensor * scale + min_val
+        except Exception as e:
+            logger.error(f"Klaida kvantuojant tenzorių su {bits} bitais: {e}. Grąžinamas originalus tenzorius.")
+            return tensor # Grąžinti originalų tenzorių, jei kvantavimas nepavyksta
+
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Užtikriname 3D įvesties formatą (Batch, Channels, Length)
+        if len(x.shape) == 2: # (batch_size, length) -> (batch_size, 1, length)
+            x = x.unsqueeze(1)
+        
+        # Encoder dalis
+        encoded = x
+        for i, layer_module in enumerate(self.encoder):
+            # Taikome kvantavimą TIK jei QAT neaktyvus ir sluoksnio indeksas galioja
+            if not self.genome.qat_enabled and i < len(self.genome.layer_bits["encoder"]):
+                bits = self.genome.layer_bits["encoder"][i]
+                encoded = self.custom_quantize(encoded, bits)
+            encoded = layer_module(encoded)
+
+        # Decoder dalis
+        decoded = encoded
+        for i, layer_module in enumerate(self.decoder):
+            # Taikome kvantavimą TIK jei QAT neaktyvus ir sluoksnio indeksas galioja
+            if not self.genome.qat_enabled and i < len(self.genome.layer_bits["decoder"]):
+                bits = self.genome.layer_bits["decoder"][i]
+                decoded = self.custom_quantize(decoded, bits)
+            decoded = layer_module(decoded)
+        
+        # Automatinis output dydžio koregavimas
+        decoded = self._adjust_output_size(decoded)
+
+        return encoded, decoded
+
+    def _adjust_output_size(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Dinamiškai koreguoja išėjimo dydį pagal SystemConfig.binance_data_points."""
+        # Suplojame tenzorių, kad galėtume dirbti su juo kaip 1D seka
+        if len(tensor.shape) > 2: # (batch, channels, length) -> (batch, channels * length)
+            tensor = tensor.view(tensor.shape[0], -1)
+
+        if tensor.shape[1] > SystemConfig.binance_data_points:
+            return tensor[:, :SystemConfig.binance_data_points]
+        elif tensor.shape[1] < SystemConfig.binance_data_points:
+            padding = torch.zeros(tensor.shape[0], SystemConfig.binance_data_points - tensor.shape[1], device=tensor.device)
+            return torch.cat((tensor, padding), dim=1)
+        return tensor
+
+
+# --- HNN Modelio Statytojas ---
+class HNNBuilder:
+    @staticmethod
+    def _get_activation(name: str) -> nn.Module:
+        activations = {
+            "GELU": nn.GELU(), "ReLU": nn.ReLU(), "Sigmoid": nn.Sigmoid(),
+            "None": nn.Identity(), "LeakyReLU": nn.LeakyReLU(), "Tanh": nn.Tanh()
+        }
+        return activations.get(name, nn.Identity())
+
+    @staticmethod
+    def calculate_output_dim(input_len: int, kernel_size: int, stride: int, padding: int, 
+                             output_padding: int = 0, dilation: int = 1, transposed: bool = False) -> int:
+        """
+        Calculates the output dimension for convolution or pooling layers.
+        Handles both regular and transposed convolutions.
+        """
+        if transposed:  # ConvTranspose
+            # Formula for ConvTranspose1d output_size
+            return max(1, (input_len - 1) * stride - 2 * padding + dilation * (kernel_size - 1) + output_padding + 1)
+        else:  # Regular Conv/Pool
+            # Formula for Conv1d/MaxPool1d/AvgPool1d output_size
+            return max(1, (input_len + 2 * padding - dilation * (kernel_size - 1) - 1) // stride + 1)
+
+
+    @staticmethod
+    def build_model_from_genome(genome: Genome, input_dim: int, device: torch.device) -> HNN_Core:
+        # Pridedama apsauga nuo negaliojančių architektūrų
+        if not genome.hnn_architecture["encoder_layers"] or not genome.hnn_architecture["decoder_layers"]:
+            logger.error(f"Netinkama genomo architektūra: encoder={len(genome.hnn_architecture['encoder_layers'])}, decoder={len(genome.hnn_architecture['decoder_layers'])}")
+            return None
+
+        encoder_modules = []
+        current_channels = 1 # Binance duomenys (batch, length) virsta (batch, 1, length)
+        current_len = input_dim
+
+        for i, layer_def in enumerate(genome.hnn_architecture["encoder_layers"]):
+            try:
+                # Padding skaičiavimas nelyginiams branduoliams
+                padding = layer_def.kernel_size // 2
+
+                if layer_def.type == "linear":
+                    # Linear sluoksnis veikia su plokščiais tenzoriais
+                    # Patobulinta sąlyga, kad išvengtume nereikalingo suplodinimo
+                    if current_channels != 1 and (len(encoder_modules) == 0 or not isinstance(encoder_modules[-1], (nn.Flatten, nn.Linear))):
+                        encoder_modules.append(nn.Flatten())
+                        current_len = current_channels * current_len # Suploto tenzoriaus ilgis
+                        current_channels = 1 # Suploto tenzoriaus kanalai
+                    
+                    # Corrected: check individual dimensions
+                    if current_len <= 0 or current_channels <= 0:
+                        raise ValueError(f"Netinkama įvesties forma Linear sluoksniui: channels={current_channels}, len={current_len}")
+                    
+                    encoder_modules.append(nn.Linear(current_len * current_channels, layer_def.out_features))
+                    current_len = layer_def.out_features # Linear išėjimas yra flat
+                    current_channels = 1 # Po linear vėl turime tik 1 "kanalą"
+                
+                elif layer_def.type == "conv":
+                    # Konvoliucinis sluoksnis. Prieš tai patikrinti, ar tenzorius 3D.
+                    if len(encoder_modules) > 0 and not (isinstance(encoder_modules[-1], (nn.Conv1d, nn.MaxPool1d, nn.AvgPool1d, nn.BatchNorm1d, nn.Identity, nn.Dropout)) or (isinstance(encoder_modules[-1], nn.Linear) and current_channels == 1)):
+                         # Jei prieš tai buvo Linear ir dabar pereiname prie Conv, reikės Unflatten
+                         logger.warning(f"HNNBuilder: Prieš Conv sluoksnį nėra Flatten/Unflatten valdymo. Gali būti matmenų klaida.")
+                    
+                    encoder_modules.append(nn.Conv1d(current_channels, layer_def.out_features, layer_def.kernel_size, layer_def.stride, padding=padding))
+                    current_len = HNNBuilder.calculate_output_dim(current_len, layer_def.kernel_size, layer_def.stride, padding, transposed=False)
+                    current_channels = layer_def.out_features
+                
+                elif layer_def.type == "dropout":
+                    encoder_modules.append(nn.Dropout(layer_def.dropout_rate))
+                
+                elif layer_def.type == "batch_norm":
+                    # BatchNorm1d taikomas 3D įvesčiai (Batch, Channels, Length)
+                    encoder_modules.append(nn.BatchNorm1d(current_channels))
+                
+                elif layer_def.type == "max_pool":
+                    encoder_modules.append(nn.MaxPool1d(layer_def.kernel_size, layer_def.stride, padding=padding))
+                    current_len = HNNBuilder.calculate_output_dim(current_len, layer_def.kernel_size, layer_def.stride, padding, transposed=False)
+                
+                elif layer_def.type == "avg_pool":
+                    encoder_modules.append(nn.AvgPool1d(layer_def.kernel_size, layer_def.stride, padding=padding))
+                    current_len = HNNBuilder.calculate_output_dim(current_len, layer_def.kernel_size, layer_def.stride, padding, transposed=False)
+                
+                if layer_def.activation != "None":
+                    encoder_modules.append(HNNBuilder._get_activation(layer_def.activation))
+            
+            except ValueError as ve:
+                logger.error(f"Klaida statant encoder sluoksnį {i} ({layer_def.type}): {ve}. Praleidžiamas.")
+                # Jei įvyko klaida, galime tiesiog praleisti šį sluoksnį arba sustabdyti statymą
+                continue # Praleidžiame sluoksnį ir tęsiame su likusiais
+            except Exception as e:
+                logger.error(f"Nenumatyta klaida statant encoder sluoksnį {i} ({layer_def.type}): {e}. Genomas gali būti netinkamas.")
+                return None # Grąžiname None, kad indicate'intume klaidą
+
+        # Po encoder bloko, visada suplojame ir pridedame Linear sluoksnį iki latent_dim_flat
+        pre_flatten_shape = (max(1, current_channels), max(1, current_len)) # Apsauga nuo nulinių matmenų
+        encoder_modules.append(nn.Flatten())
+        # Apsauga nuo nulio dydžio įvesties Flatten sluoksniui
+        flat_input_dim = max(1, pre_flatten_shape[0] * pre_flatten_shape[1])
+        encoder_modules.append(nn.Linear(flat_input_dim, genome.hnn_architecture["latent_dim_flat"]))
+        encoder = nn.Sequential(*encoder_modules)
+
+        # Decoder dalis
+        decoder_modules = []
+        # Pradedame nuo latent_dim_flat ir atkuriamas pre_flatten_shape
+        decoder_modules.append(nn.Linear(genome.hnn_architecture["latent_dim_flat"], flat_input_dim))
+        decoder_modules.append(nn.Unflatten(1, pre_flatten_shape))
+        current_channels, current_len = pre_flatten_shape
+
+        for i, layer_def in enumerate(genome.hnn_architecture["decoder_layers"]):
+            try:
+                padding = layer_def.kernel_size // 2
+                # ConvTranspose1d output_padding reikalauja output_padding < stride
+                # Pridedame apsaugą, kad output_padding neviršytų stride - 1
+                output_padding = min(layer_def.stride - 1, layer_def.kernel_size - 1)
+                output_padding = max(0, output_padding) # Užtikriname, kad output_padding yra >= 0
+                
+                if layer_def.type == "linear":
+                    # Jei prieš tai buvo Conv/Pool, reikės suploti
+                    if len(decoder_modules) > 0 and not isinstance(decoder_modules[-1], nn.Flatten):
+                        decoder_modules.append(nn.Flatten())
+                        current_len = current_channels * current_len
+                        current_channels = 1
+                    
+                    if current_len <= 0 or current_channels <= 0:
+                        raise ValueError(f"Netinkama įvesties forma Linear sluoksniui: channels={current_channels}, len={current_len}")
+
+                    decoder_modules.append(nn.Linear(current_len * current_channels, layer_def.out_features))
+                    current_len = layer_def.out_features
+                    current_channels = 1
+                
+                elif layer_def.type == "conv": # ConvTranspose1d yra tinkamesnis decoder'yje
+                    decoder_modules.append(nn.ConvTranspose1d(current_channels, layer_def.out_features, layer_def.kernel_size, layer_def.stride, padding, output_padding))
+                    # Corrected: added transposed=True
+                    current_len = HNNBuilder.calculate_output_dim(current_len, layer_def.kernel_size, layer_def.stride, padding, output_padding, transposed=True)
+                    current_channels = layer_def.out_features
+                
+                elif layer_def.type == "dropout":
+                    decoder_modules.append(nn.Dropout(layer_def.dropout_rate))
+                
+                elif layer_def.type == "batch_norm":
+                    decoder_modules.append(nn.BatchNorm1d(current_channels))
+                
+                elif layer_def.type == "max_pool" or layer_def.type == "avg_pool":
+                    # Pooling decoder'yje retai naudojamas tiesiogiai atkurti dimensijas.
+                    # Šiuo atveju naudojame Upsample, kad atitiktų stride.
+                    decoder_modules.append(nn.Upsample(scale_factor=layer_def.stride, mode='nearest'))
+                    current_len *= layer_def.stride
+                
+                if layer_def.activation != "None":
+                    decoder_modules.append(HNNBuilder._get_activation(layer_def.activation))
+            
+            except ValueError as ve:
+                logger.error(f"Klaida statant decoder sluoksnį {i} ({layer_def.type}): {ve}. Praleidžiamas.")
+                continue
+            except Exception as e:
+                logger.error(f"Nenumatyta klaida statant decoder sluoksnį {i} ({layer_def.type}): {e}. Genomas gali būti netinkamas.")
+                return None
+
+        # Paskutinis sluoksnis, atkuriantis originalų input_dim
+        # Užtikriname, kad paskutinis išėjimas atitiktų pradinį input_dim
+        # Tai reiškia, kad galiausiai turi būti 1 kanalas ir input_dim ilgis
+        # Šiam pavyzdžiui, naudosime Conv1d, kad sureguliuotume kanalus į 1.
+        # Ir galiausiai, galime pridėti adaptacinį Linear sluoksnį, jei galutinis current_len nesutampa
+        # su pradiniu input_dim.
+        final_output_len = max(1, current_len) # Apsauga nuo 0
+        
+        # Pirmiausia, įsitikiname, kad kanalų skaičius tinkamas.
+        # Jei paskutinis sluoksnis nebuvo konvoliucinis ir current_channels > 1, gali prireikti Conv1d
+        if current_channels != 1:
+            decoder_modules.append(nn.Conv1d(current_channels, 1, kernel_size=1))
+            current_channels = 1
+        
+        # Jei po visų sluoksnių current_len vis dar nesutampa su input_dim, pridėkite Linear sluoksnį
+        # Tik jei current_channels == 1 (t.y., po paskutinio Conv1d)
+        if current_channels == 1 and final_output_len != input_dim:
+            # Reikės suploti ir vėl išplėsti, jei matmenys nesutampa
+            decoder_modules.append(nn.Flatten())
+            decoder_modules.append(nn.Linear(final_output_len, input_dim))
+            current_len = input_dim
+
+        decoder = nn.Sequential(*decoder_modules)
+        
+        # Tikriname ar encoder ir decoder yra validūs, jei ne, grąžiname None
+        if not encoder_modules or not decoder_modules:
+            logger.error("Nepavyko sukurti encoder arba decoder modulių. Genomas atmetamas.")
+            return None
+
+        model = HNN_Core(encoder, decoder, genome.hnn_architecture["latent_dim_flat"], genome, pre_flatten_shape)
+        return model.to(device)
+
+
+# --- Genetinis Algoritmas ---
+class GeneticArchitect:
+    def __init__(self, config: SystemConfig, initial_input_dim: int):
+        self.config = config
+        self.population: List[Genome] = []
+        self.initial_input_dim = initial_input_dim
+        self.last_vram_clear_time = time.time()
+
+    async def initialize_population(self, population_size: int):
+        self.population = []
+        for _ in range(population_size):
+            genome = Genome()
+            # Užtikriname, kad pradiniai genomai būtų validūs, bandom kurti modelį
+            # Jei modelio kūrimas nepavyksta, generuojame naują genomą
+            attempts = 0
+            while attempts < 5: # Bandome iki 5 kartų sukurti validų genomą
+                model = HNNBuilder.build_model_from_genome(genome, self.initial_input_dim, torch.device(self.config.device))
+                if model is not None:
+                    self.population.append(genome)
+                    del model # Atlaisviname atmintį
+                    break
+                else:
+                    logger.warning(f"Nepavyko sukurti modelio {genome.id[:8]}, bandymas {attempts+1}. Generuojamas naujas genomas.")
+                    genome = Genome() # Generuojame naują genomą
+                    attempts += 1
+            if attempts == 5 and genome not in self.population:
+                logger.error(f"Nepavyko sukurti validžios populiacijos. Populiacijos dydis: {len(self.population)}")
+                break # Sustabdome inicializavimą, jei nepavyksta sukurti genomų
+        
+        if not self.population:
+            raise RuntimeError("Nepavyko inicializuoti genomo populiacijos. Patikrinkite HNNBuilder logiką.")
+
+        logger.info(f"Populiacija inicializuota su {len(self.population)} genomų.")
+
+
+    def _check_vram_limit(self, genome: Genome):
+        if not torch.cuda.is_available():
+            return # Grįžtame, jei CUDA neprieinama
+        
+        try:
+            torch.cuda.empty_cache() # Valome cache
+            allocated_vram = torch.cuda.memory_allocated(0) / (1024 ** 2) # MB
+            reserved_vram = torch.cuda.memory_reserved(0) / (1024 ** 2) # MB
+            
+            genome.vram_used_mb = allocated_vram # Atnaujiname naudojamą VRAM
+
+            # Tikriname rezervuotą VRAM prieš įspėjimą/valymą
+            if reserved_vram > genome.vram_limit_mb * genome.vram_warning_threshold:
+                current_time = time.time()
+                if (current_time - self.last_vram_clear_time) > genome.min_time_between_vram_clears_sec:
+                    logger.warning(f"Genomas {genome.id[:8]}: Viršytas VRAM slenkstis ({reserved_vram:.2f}MB / {genome.vram_limit_mb}MB, naudojama: {allocated_vram:.2f}MB). Valoma GPU atmintis.")
+                    torch.cuda.empty_cache()
+                    self.last_vram_clear_time = current_time
+                else:
+                    logger.debug(f"Genomas {genome.id[:8]}: VRAM slenkstis viršytas, bet per anksti valyti (liko {genome.min_time_between_vram_clears_sec - (current_time - self.last_vram_clear_time):.2f}s).")
+        except RuntimeError as e:
+            logger.error(f"Klaida tikrinant VRAM: {e}. Tęsiamas darbas be VRAM stebėsenos.")
+
+
+    async def evaluate_genome(self, genome: Genome) -> None:
+        device = torch.device(self.config.device)
+        dummy_data = torch.randn(genome.batch_size, self.initial_input_dim).to(device)
+
+        hnn_model = HNNBuilder.build_model_from_genome(genome, self.initial_input_dim, device)
+        if hnn_model is None: # HNNBuilder gali grąžinti None, jei architektūra netinkama
+            genome.fitness = -float('inf') # Suteikiame labai mažą fitnesą
+            logger.warning(f"Genomas {genome.id[:8]}: Modelio kūrimas nepavyko, nustatytas labai mažas fitnesas.")
+            return
+
+        # QAT paruošimas, jei įjungtas ir bitai palaikomi
+        if genome.qat_enabled:
+            try:
+                # Dinaminė modulių paieška su named_modules
+                # PyTorch QAT `prepare_qat` apdoroja tinkamus modulius automatiškai
+                # pagal qconfig, jei jie yra `nn.Sequential` viduje.
+                hnn_model.qconfig = torch.quantization.get_default_qat_qconfig('fbgemm')
+                torch.quantization.prepare_qat(hnn_model, inplace=True)
+                logger.debug(f"Genome {genome.id[:8]} QAT paruošimas sėkmingas.")
+                if device.type == 'cuda':
+                    logger.warning("QAT GPU palaikymas PyTorch'e ribotas su fbgemm. Rekomenduojama TensorRT/kitos specifinės optimizacijos ateityje.")
+
+            except Exception as e:
+                logger.warning(f"Genome {genome.id[:8]} QAT paruošimas nepavyko: {e}. Išjungiamas QAT šiam genomui.")
+                genome.qat_enabled = False # Išjungti QAT, jei nepavyko
+
+        criterion = nn.MSELoss()
+        optimizer = optim.Adam(hnn_model.parameters(), lr=genome.learning_rate)
+
+        hnn_model.train()
+        for epoch in range(genome.training_epochs):
+            optimizer.zero_grad()
+            encoded_output, decoded_output = hnn_model(dummy_data)
+            loss = criterion(decoded_output, dummy_data)
+            loss.backward()
+            optimizer.step()
+
+            self._check_vram_limit(genome) # Tikriname VRAM po kiekvienos epochos
+        
+        # Jei QAT buvo įjungtas, konvertuojame modelį po treniravimo
+        if genome.qat_enabled:
+            try:
+                torch.quantization.convert(hnn_model, inplace=True)
+                logger.debug(f"Genome {genome.id[:8]} QAT konversija sėkminga.")
+            except Exception as e:
+                logger.warning(f"Genome {genome.id[:8]} QAT konversija nepavyko: {e}. Modelis liko nekvantuotas.")
+                genome.qat_enabled = False # Išjungti QAT, jei konversija nepavyko
+        
+        # Perkeliame eval() ir modelio ištrynimą PO vertinimo
+        hnn_model.eval() 
+        with torch.no_grad():
+            encoded_val, decoded_val = hnn_model(dummy_data)
+            val_loss = criterion(decoded_val, dummy_data)
+            
+            # Normalizuotas tikslumas (0-1)
+            accuracy_score = 1.0 - (val_loss.item() / (dummy_data.max() - dummy_data.min()).item() + 1e-8) # Pridedam epsilon
+            genome.accuracy = max(0.0, min(1.0, accuracy_score)) # Ribojame tarp 0 ir 1
+
+        genome.loss = val_loss.item()
+        
+        # Atlaisviname modelio atmintį po vertinimo
+        del hnn_model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        # Apskaičiuojame vidutinį bitų skaičių
+        total_bits = sum(genome.layer_bits.get("encoder", [])) + sum(genome.layer_bits.get("decoder", []))
+        num_layers = len(genome.layer_bits.get("encoder", [])) + len(genome.layer_bits.get("decoder", []))
+        avg_bits_per_layer = total_bits / (num_layers + 1e-5) # Apsauga nuo dalybos iš nulio
+
+        # Kompresijos santykio skaičiavimas
+        input_size_bits = SystemConfig.binance_data_points * 32 # Prielaida: float32 input = 32 bitai/taškas
+        latent_size_bits = max(1, genome.hnn_architecture["latent_dim_flat"]) * avg_bits_per_layer
+        genome.compression_ratio = input_size_bits / latent_size_bits if latent_size_bits > 0 else 0.0
+
+        # Fitneso skaičiavimas su dinamine formule ir baudomis
+        # Normalizuojame VRAM balą
+        vram_score = max(0.0, min(1.0, 1.0 - genome.vram_used_mb / (genome.vram_limit_mb + 1e-8))) # Apsauga nuo 0
+        
+        # Bauda už didelius bitus
+        if avg_bits_per_layer > genome.large_bit_penalty_threshold:
+            vram_score *= genome.large_bit_penalty_factor
+            logger.debug(f"Genomas {genome.id[:8]}: Taikyta bauda už didelius bitus. Vid. bitų: {avg_bits_per_layer:.2f}, baudos faktorius: {genome.large_bit_penalty_factor:.2f}")
+
+        # AI gairių bonusas (simuliacinis bonusas)
+        ai_bonus = random.uniform(0.0, 0.1)
+
+        # Fitneso svorių normalizavimas
+        total_weight_sum = sum(genome.fitness_weights.values()) + 1e-8 # Apsauga nuo 0
+        normalized_weights = {k: v / total_weight_sum for k, v in genome.fitness_weights.items()}
+
+        # Dinaminė fitneso formulė
+        if genome.fitness_formula_type == "linear":
+            genome.fitness = (genome.accuracy * normalized_weights["hnn_accuracy"] +
+                              vram_score * normalized_weights["vram_efficiency"] +
+                              genome.compression_ratio * normalized_weights["compression_ratio_impact"] +
+                              ai_bonus * normalized_weights["ai_guidance_bonus"])
+        elif genome.fitness_formula_type == "exponential":
+            genome.fitness = (math.exp(genome.accuracy) * normalized_weights["hnn_accuracy"] +
+                              math.exp(vram_score) * normalized_weights["vram_efficiency"] +
+                              math.exp(genome.compression_ratio / 10.0) * normalized_weights["compression_ratio_impact"] +
+                              math.exp(ai_bonus) * normalized_weights["ai_guidance_bonus"])
+        elif genome.fitness_formula_type == "multiplicative":
+            # Multiplikacinei formulei normalizavimas gali veikti kitaip.
+            # Užtikriname, kad jokie koeficientai nebūtų 0, kad neanuliuotų visko.
+            genome.fitness = (max(1e-8, genome.accuracy) * max(1e-8, vram_score) * max(1e-8, genome.compression_ratio) * (1 + ai_bonus) *
+                              (total_weight_sum)) # Naudojame visų svorių sumą kaip skalę
+        elif genome.fitness_formula_type == "quadratic":
+            genome.fitness = (genome.accuracy**2 * normalized_weights["hnn_accuracy"] +
+                              vram_score**2 * normalized_weights["vram_efficiency"] +
+                              genome.compression_ratio**2 * normalized_weights["compression_ratio_impact"] +
+                              ai_bonus**2 * normalized_weights["ai_guidance_bonus"])
+        else:
+            genome.fitness = 0.0 # Neteisingas formulės tipas
+
+        # Pritaikome genomui specifinius svorius per papildomą skalę
+        # Šis žingsnis užtikrina, kad "dinaminis" fitnesas iš tiesų priklausytų nuo GA valdomų svorių
+        # Nėra statinių koeficientų, visi svoriai ateina iš genomo
+        genome.fitness *= (genome.fitness_weights["hnn_accuracy"] + genome.fitness_weights["vram_efficiency"] +
+                           genome.fitness_weights["compression_ratio_impact"] + genome.fitness_weights["ai_guidance_bonus"]) / (4.0 + 1e-8) # Vidurkis arba suma
+
+        logger.info(f"Genomas {genome.id[:8]} įvertintas: Fitnesas={genome.fitness:.4f}, Loss={genome.loss:.4f}, Accuracy={genome.accuracy:.4f}, VRAM={genome.vram_used_mb:.2f}MB, Comp.Ratio={genome.compression_ratio:.2f}, AvgBits={avg_bits_per_layer:.2f}")
+        logger.debug(f"Genomo bitų pasiskirstymas: Encoder={genome.layer_bits.get('encoder', [])}, Decoder={genome.layer_bits.get('decoder', [])}")
+
+    def select_parents(self, num_parents: int) -> List[Genome]:
+        # Filtruojame genomus su neigiamu fitnesu (kurie sugedo)
+        valid_population = [g for g in self.population if g.fitness > 0]
+        if not valid_population:
+            logger.warning("Nėra validžių genomų atrankai. Grąžinami atsitiktiniai genomai iš visos populiacijos.")
+            return random.sample(self.population, min(num_parents, len(self.population)))
+        
+        total_fitness = sum(g.fitness for g in valid_population)
+        if total_fitness == 0:
+            return random.sample(valid_population, min(num_parents, len(valid_population)))
+
+        selection_probs = [g.fitness / total_fitness for g in valid_population]
+        parents = random.choices(valid_population, weights=selection_probs, k=num_parents)
+        return parents
+
+    def crossover(self, parent1: Genome, parent2: Genome) -> Tuple[Genome, Genome]:
+        # Apsauga nuo tuščių tėvų architektūrų
+        if not parent1.hnn_architecture["encoder_layers"] or \
+           not parent1.hnn_architecture["decoder_layers"] or \
+           not parent2.hnn_architecture["encoder_layers"] or \
+           not parent2.hnn_architecture["decoder_layers"]:
+            logger.warning("Kryžminimas: bent vieno tėvo architektūra tuščia. Grąžinami nauji atsitiktiniai genomai.")
+            return Genome(generation=parent1.generation + 1), Genome(generation=parent1.generation + 1)
+
+        child1 = Genome(parent_ids=(parent1.id, parent2.id), generation=parent1.generation + 1)
+        child2 = Genome(parent_ids=(parent2.id, parent1.id), generation=parent1.generation + 1)
+
+        for section_key in ["encoder_layers", "decoder_layers"]:
+            # Pataisyta: teisingas skliaustų uždarymas
+            min_len = min(len(parent1.hnn_architecture[section_key]), len(parent2.hnn_architecture[section_key]))
+            crossover_point = random.randint(0, min_len)
+            
+            # HNN architektūros sluoksnių kryžminimas
+            child1.hnn_architecture[section_key] = parent1.hnn_architecture[section_key][:crossover_point] + parent2.hnn_architecture[section_key][crossover_point:]
+            child2.hnn_architecture[section_key] = parent2.hnn_architecture[section_key][:crossover_point] + parent1.hnn_architecture[section_key][crossover_point:]
+
+            # Bitų sąrašų atnaujinimas pagal naują architektūrą
+            bits_section = section_key.replace("_layers", "") 
+            
+            # Koreguotas bitų kryžminimas
+            parent1_bits = parent1.layer_bits.get(bits_section, [])
+            parent2_bits = parent2.layer_bits.get(bits_section, [])
+            min_len_bits = min(len(parent1_bits), len(parent2_bits))
+            crossover_point_bits = random.randint(0, min_len_bits)
+            
+            child1.layer_bits[bits_section] = parent1_bits[:crossover_point_bits] + parent2_bits[crossover_point_bits:]
+            child2.layer_bits[bits_section] = parent2_bits[:crossover_point_bits] + parent1_bits[crossover_point_bits:]
+
+            # Užtikriname, kad bitų sąrašas atitiktų sluoksnių skaičių
+            target_len1 = len(child1.hnn_architecture[section_key])
+            if len(child1.layer_bits[bits_section]) < target_len1:
+                child1.layer_bits[bits_section].extend([random.randint(1, 512) for _ in range(target_len1 - len(child1.layer_bits[bits_section]))])
+            elif len(child1.layer_bits[bits_section]) > target_len1:
+                child1.layer_bits[bits_section] = child1.layer_bits[bits_section][:target_len1]
+
+            target_len2 = len(child2.hnn_architecture[section_key])
+            if len(child2.layer_bits[bits_section]) < target_len2:
+                child2.layer_bits[bits_section].extend([random.randint(1, 512) for _ in range(target_len2 - len(child2.layer_bits[bits_section]))])
+            elif len(child2.layer_bits[bits_section]) > target_len2:
+                child2.layer_bits[bits_section] = child2.layer_bits[bits_section][:target_len2]
+
+        # Kryžminame kitus parametrus
+        for param in ["latent_dim_flat", "training_epochs", "learning_rate", "batch_size", "qat_enabled", "vram_limit_mb",
+                      "min_time_between_vram_clears_sec", "vram_warning_threshold",
+                      "large_bit_penalty_threshold", "large_bit_penalty_factor", "fitness_formula_type"]:
+            setattr(child1, param, getattr(random.choice([parent1, parent2]), param))
+            setattr(child2, param, getattr(random.choice([parent1, parent2]), param))
+
+        # Fitneso svorių kryžminimas
+        for key in parent1.fitness_weights:
+            child1.fitness_weights[key] = random.choice([parent1.fitness_weights[key], parent2.fitness_weights[key]])
+            child2.fitness_weights[key] = random.choice([parent1.fitness_weights[key], parent2.fitness_weights[key]])
+
+        return child1, child2
+
+    def mutate(self, genome: Genome) -> None:
+        # Mutacijos gylio kontrolė
+        mutation_strength = random.choice([1, 2, 3]) # Kiek kartų bandysime mutuoti
+        for _ in range(mutation_strength):
+            mutation_type = random.randint(0, 11) # Daugiau mutacijos galimybių
+
+            if mutation_type < 3: # Mutacija HNN architektūros sluoksnių (tipas, savybės)
+                section = random.choice(["encoder_layers", "decoder_layers"])
+                if genome.hnn_architecture[section]: # Keisti esamą sluoksnį
+                    idx = random.randint(0, len(genome.hnn_architecture[section]) - 1)
+                    layer = genome.hnn_architecture[section][idx]
+                    layer.type = random.choice(["linear", "conv", "dropout", "batch_norm", "max_pool", "avg_pool"])
+                    layer.activation = random.choice(["GELU", "ReLU", "Sigmoid", "None", "LeakyReLU", "Tanh"])
+                    layer.out_features = random.randint(32, 256)
+                    layer.dropout_rate = random.uniform(0.1, 0.5) if layer.type == "dropout" else 0.0
+                    if layer.type in ["conv", "max_pool", "avg_pool"]:
+                        layer.kernel_size = random.choice([3, 5])
+                        if layer.kernel_size % 2 == 0: layer.kernel_size = max(3, layer.kernel_size - 1) # Nelyginis
+                        layer.stride = random.choice([1, 2])
+                    else:
+                        layer.kernel_size = 1
+                        layer.stride = 1
+                    logger.debug(f"Genomas {genome.id[:8]}: Mutavo {section} sluoksnį {idx} (tipas: {layer.type}).")
+
+            elif mutation_type == 3: # Pridėti naują sluoksnį
+                section = random.choice(["encoder_layers", "decoder_layers"])
+                genome.hnn_architecture[section].append(HNNLayer())
+                section_key_bits = section.replace("_layers", "")
+                # Užtikriname, kad bitų masyvas egzistuotų
+                if section_key_bits not in genome.layer_bits:
+                    genome.layer_bits[section_key_bits] = []
+                genome.layer_bits[section_key_bits].append(random.randint(1, 512)) # Pridėti bitų nustatymą
+                logger.debug(f"Genomas {genome.id[:8]}: Pridėjo naują sluoksnį prie {section}.")
+
+            elif mutation_type == 4: # Pašalinti sluoksnį (bet palikti bent vieną)
+                section = random.choice(["encoder_layers", "decoder_layers"])
+                if len(genome.hnn_architecture[section]) > 1: # Palikti bent vieną sluoksnį
+                    idx = random.randint(0, len(genome.hnn_architecture[section]) - 1)
+                    genome.hnn_architecture[section].pop(idx)
+                    section_key_bits = section.replace("_layers", "")
+                    # Užtikriname, kad bitų masyvas egzistuotų prieš bandant pašalinti
+                    if section_key_bits in genome.layer_bits and len(genome.layer_bits[section_key_bits]) > idx:
+                        genome.layer_bits[section_key_bits].pop(idx) # Pašalinti ir bitų nustatymą
+                    logger.debug(f"Genomas {genome.id[:8]}: Pašalino sluoksnį iš {section}.")
+
+            elif mutation_type == 5: # Mutacija latent_dim_flat
+                genome.hnn_architecture["latent_dim_flat"] = max(16, min(512, genome.hnn_architecture["latent_dim_flat"] + random.randint(-16, 16)))
+                logger.debug(f"Genomas {genome.id[:8]}: Mutavo latent_dim_flat į {genome.hnn_architecture['latent_dim_flat']}.")
+
+            elif mutation_type == 6: # Mutacija sluoksnio bitų skaičiui (1-512)
+                section_key = random.choice(["encoder", "decoder"])
+                if genome.layer_bits.get(section_key):
+                    idx = random.randint(0, len(genome.layer_bits[section_key]) - 1)
+                    current_bits = genome.layer_bits[section_key][idx]
+                    delta = random.choice([-8, -4, -2, -1, 1, 2, 4, 8, 16]) # Logaritminis/laipsninis pokytis
+                    new_bits = max(1, min(512, current_bits + delta))
+                    genome.layer_bits[section_key][idx] = new_bits
+                    logger.debug(f"Genomas {genome.id[:8]}: Mutavo {section_key} sluoksnio {idx} bitus į {new_bits}.")
+
+            elif mutation_type == 7: # Mutacija GA proceso parametrams (epochs, lr, batch_size)
+                param_to_mutate = random.choice(["training_epochs", "learning_rate", "batch_size"])
+                if param_to_mutate == "training_epochs":
+                    genome.training_epochs = max(5, min(100, genome.training_epochs + random.randint(-10, 10)))
+                elif param_to_mutate == "learning_rate":
+                    genome.learning_rate = max(1e-5, min(1e-1, genome.learning_rate * random.uniform(0.8, 1.2)))
+                elif param_to_mutate == "batch_size":
+                    genome.batch_size = random.choice([32, 64, 128, 256])
+                logger.debug(f"Genomas {genome.id[:8]}: Mutavo {param_to_mutate}.")
+
+            elif mutation_type == 8: # Mutacija fitneso svoriams
+                weight_key = random.choice(list(genome.fitness_weights.keys()))
+                genome.fitness_weights[weight_key] = max(0.0, min(1.0, genome.fitness_weights[weight_key] + random.uniform(-0.1, 0.1)))
+                logger.debug(f"Genomas {genome.id[:8]}: Mutavo fitness_weight '{weight_key}'.")
+            
+            elif mutation_type == 9: # Mutacija fitneso formulės tipui
+                genome.fitness_formula_type = random.choice(["linear", "exponential", "multiplicative", "quadratic"])
+                logger.debug(f"Genomas {genome.id[:8]}: Mutavo fitness_formula_type į '{genome.fitness_formula_type}'.")
+
+            elif mutation_type == 10: # Mutacija VRAM/bitų baudos parametrams ir QAT
+                param_to_mutate = random.choice(["vram_limit_mb", "min_time_between_vram_clears_sec", "vram_warning_threshold", "large_bit_penalty_threshold", "large_bit_penalty_factor", "qat_enabled"])
+                if param_to_mutate == "vram_limit_mb":
+                    genome.vram_limit_mb = max(1000, min(16000, genome.vram_limit_mb + random.randint(-1000, 1000)))
+                elif param_to_mutate == "min_time_between_vram_clears_sec":
+                    genome.min_time_between_vram_clears_sec = max(1, min(20, genome.min_time_between_vram_clears_sec + random.randint(-2, 2)))
+                elif param_to_mutate == "vram_warning_threshold":
+                    genome.vram_warning_threshold = max(0.5, min(0.99, genome.vram_warning_threshold + random.uniform(-0.05, 0.05)))
+                elif param_to_mutate == "large_bit_penalty_threshold":
+                    genome.large_bit_penalty_threshold = max(32, min(512, genome.large_bit_penalty_threshold + random.randint(-32, 32)))
+                elif param_to_mutate == "large_bit_penalty_factor":
+                    genome.large_bit_penalty_factor = max(0.1, min(1.0, genome.large_bit_penalty_factor + random.uniform(-0.1, 0.1)))
+                elif param_to_mutate == "qat_enabled":
+                    genome.qat_enabled = not genome.qat_enabled
+                logger.debug(f"Genomas {genome.id[:8]}: Mutavo {param_to_mutate}.")
+            
+            elif mutation_type == 11: # Naujas mutacijos tipas - latent dim mutacija
+                delta = random.choice([-0.1, -0.05, 0.05, 0.1])
+                for key in genome.fitness_weights:
+                    genome.fitness_weights[key] = max(0.1, min(1.0, genome.fitness_weights[key] + delta))
+                logger.debug(f"Genomas {genome.id[:8]}: Mutavo latent dim.")
+
+        # Architektūros validavimas po mutacijų (užtikriname, kad neliktų tuščių sluoksnių)
+        if not genome.hnn_architecture["encoder_layers"]:
+            genome.hnn_architecture["encoder_layers"].append(HNNLayer())
+            if "encoder" not in genome.layer_bits: genome.layer_bits["encoder"] = [] # Apsauga
+            genome.layer_bits["encoder"].append(random.randint(1, 512))
+            logger.warning(f"Genomas {genome.id[:8]}: Encoder sluoksniai buvo tušti po mutacijos, pridėtas numatytasis.")
+        if not genome.hnn_architecture["decoder_layers"]:
+            genome.hnn_architecture["decoder_layers"].append(HNNLayer())
+            if "decoder" not in genome.layer_bits: genome.layer_bits["decoder"] = [] # Apsauga
+            genome.layer_bits["decoder"].append(random.randint(1, 512))
+            logger.warning(f"Genomas {genome.id[:8]}: Decoder sluoksniai buvo tušti po mutacijos, pridėtas numatytasis.")
+
+
+    async def evolve(self, population_size: int, num_generations: int, num_parents: int, eval_batch_size: int = 4):
+        """
+        Vykdo genetinio algoritmo evoliucijos procesą.
+        :param population_size: Populiacijos dydis.
+        :param num_generations: Generacijų skaičius.
+        :param num_parents: Tėvų, pasirenkamų kryžminimui, skaičius.
+        :param eval_batch_size: Kiek genomų vertinti vienu metu (GPU VRAM optimizavimui).
+        """
+        await self.initialize_population(population_size)
+
+        for generation in range(num_generations):
+            start_time_gen = time.time()
+            logger.info(f"--- Pradedama generacija {generation + 1}/{num_generations} ---")
+
+            # 1. Įvertinimas (Evaluate) - batch pagrindu
+            evaluated_count = 0
+            for i in range(0, len(self.population), eval_batch_size):
+                batch = self.population[i:i+eval_batch_size]
+                evaluation_tasks = [self.evaluate_genome(genome) for genome in batch]
+                await asyncio.gather(*evaluation_tasks)
+                evaluated_count += len(batch)
+                logger.info(f"Generacija {generation + 1}: Įvertinta {evaluated_count}/{len(self.population)} genomų.")
+
+            # 2. Atranka (Selection)
+            self.population.sort(key=lambda g: g.fitness, reverse=True) # Rūšiuojame pagal fitnesą
+            
+            # Elitizmas: Išlaikome geriausius genomus kitai kartai
+            elite_count = max(1, population_size // 10) # Pvz., 10% elito
+            next_generation = self.population[:elite_count]
+            
+            # Pašaliname blogus genomus, kurie negalėjo sugeneruoti modelio
+            next_generation = [g for g in next_generation if g.fitness > -float('inf')]
+
+            logger.info(f"Pasirinkta {len(next_generation)} elito genomų (geriausi). Geriausias fitnesas: {self.population[0].fitness:.4f}")
+
+            # 3. Kryžminimas ir Mutacija (Crossover & Mutation)
+            parents = self.select_parents(num_parents)
+            num_new_children = population_size - len(next_generation) # Likučių užpildymas
+            children_count = 0
+            
+            while children_count < num_new_children:
+                if len(parents) < 2: # Nepakanka tėvų
+                    logger.warning("Nepakanka tėvų kryžminimui, generuojami atsitiktiniai genomai.")
+                    child1 = Genome(generation=generation + 1)
+                    self.mutate(child1) # Mutuojame ir atsitiktinius
+                    next_generation.append(child1)
+                    children_count += 1
+                    continue
+
+                p1, p2 = random.sample(parents, 2)
+                child1, child2 = self.crossover(p1, p2)
+                
+                self.mutate(child1)
+                self.mutate(child2)
+                
+                next_generation.append(child1)
+                children_count += 1
+                if children_count < num_new_children:
+                    next_generation.append(child2)
+                    children_count += 1
+            
+            # Užtikriname, kad populiacijos dydis atitiktų `population_size`
+            self.population = next_generation[:population_size] # Apkarpyti, jei viršijo
+            
+            end_time_gen = time.time()
+            logger.info(f"Generacija {generation + 1} baigta per {end_time_gen - start_time_gen:.2f}s. Nauja populiacija: {len(self.population)} genomų.")
+
+        logger.info("Evoliucija baigta.")
+        self.population.sort(key=lambda g: g.fitness, reverse=True)
+        best_genome = self.population[0]
+        logger.info(f"\n--- Geriausias genomas ---")
+        logger.info(f"ID: {best_genome.id[:8]}, Fitnesas={best_genome.fitness:.4f}, Loss={best_genome.loss:.4f}, Accuracy={best_genome.accuracy:.4f}, VRAM={best_genome.vram_used_mb:.2f}MB, Comp.Ratio={best_genome.compression_ratio:.2f}, AvgBits={sum(best_genome.layer_bits.get('encoder', []) + best_genome.layer_bits.get('decoder', [])) / (len(best_genome.layer_bits.get('encoder', [])) + len(best_genome.layer_bits.get('decoder', [])) + 1e-5):.2f}")
+        logger.info(f"  QAT Enabled: {best_genome.qat_enabled}, Training Epochs: {best_genome.training_epochs}, Learning Rate: {best_genome.learning_rate:.5f}, Batch Size: {best_genome.batch_size}")
+        logger.info(f"  Fitness Formula: {best_genome.fitness_formula_type}, Fitness Weights: {best_genome.fitness_weights}")
+        logger.info(f"  VRAM Limit: {best_genome.vram_limit_mb}MB, VRAM Warn Threshold: {best_genome.vram_warning_threshold:.2f}, Min Clear Time: {best_genome.min_time_between_vram_clears_sec}s")
+        logger.info(f"  Large Bit Penalty Threshold: {best_genome.large_bit_penalty_threshold}, Factor: {best_genome.large_bit_penalty_factor:.2f}")
+
+        logger.info("\nEncoder Architektūra:")
+        for i, layer in enumerate(best_genome.hnn_architecture["encoder_layers"]):
+            logger.info(f"  Sluoksnis {i+1} (bitai: {best_genome.layer_bits['encoder'][i] if i < len(best_genome.layer_bits.get('encoder', [])) else 'N/A'}): Tipas='{layer.type}', Out Features={layer.out_features}, Aktyvacija='{layer.activation}', Dropout={layer.dropout_rate:.2f}, Kernel={layer.kernel_size}, Stride={layer.stride}")
+
+        logger.info("\nDecoder Architektūra:")
+        for i, layer in enumerate(best_genome.hnn_architecture["decoder_layers"]):
+            logger.info(f"  Sluoksnis {i+1} (bitai: {best_genome.layer_bits['decoder'][i] if i < len(best_genome.layer_bits.get('decoder', [])) else 'N/A'}): Tipas='{layer.type}', Out Features={layer.out_features}, Aktyvacija='{layer.activation}', Dropout={layer.dropout_rate:.2f}, Kernel={layer.kernel_size}, Stride={layer.stride}")
+
+        return best_genome
+
+# --- Pagrindinis Vykdymas ---
+async def main():
+    system_config = SystemConfig()
+    initial_input_dim = system_config.binance_data_points
+    
+    population_size = 5 
+    num_generations = 10 
+    num_parents = 2 
+    eval_batch_size = 2 # Kiek genomų vertinti vienu metu
+
+    ga_architect = GeneticArchitect(system_config, initial_input_dim)
+    best_genome = await ga_architect.evolve(population_size, num_generations, num_parents, eval_batch_size)
+
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -1,0 +1,839 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import uuid
+import random
+import math
+import logging
+import asyncio
+import time
+import yaml
+import structlog
+import sys
+import copy # Importuojame copy modulį
+from typing import Dict, Any, List, Tuple, Optional
+from pydantic import BaseModel, Field, ValidationError, model_validator
+
+# --- Konfigūracija ir Logavimas ---
+# Pydantic modeliai konfigūracijos validavimui
+class SystemConfig(BaseModel):
+    binance_data_points: int = Field(..., gt=0)
+    vram_limit_mb: int = Field(..., gt=0)
+    log_level: str = "INFO"
+    log_file_prefix: str = "genetic_architect_log"
+
+class GAConfig(BaseModel):
+    population_size: int = Field(..., gt=0)
+    num_generations: int = Field(..., gt=0)
+    mutation_rate: float = Field(..., ge=0.0, le=1.0)
+    crossover_rate: float = Field(..., ge=0.0, le=1.0)
+
+class HNNConfig(BaseModel):
+    latent_dim_flat: int = Field(..., gt=0)
+    supported_quantization_bits: List[int] = Field(..., min_length=1)
+    training_epochs: int = Field(..., gt=0)
+    latent_dim_mutation_range: Tuple[int, int] = Field((1, 10), description="Min and max for latent_dim_flat mutation")
+
+    @model_validator(mode='after')
+    def check_latent_dim_mutation_range(self) -> 'HNNConfig':
+        min_dim, max_dim = self.latent_dim_mutation_range
+        if min_dim > max_dim:
+            raise ValueError(f"latent_dim_mutation_range: min_dim ({min_dim}) cannot be greater than max_dim ({max_dim}).")
+        if min_dim <= 0 or max_dim <= 0:
+            raise ValueError("latent_dim_mutation_range: min_dim and max_dim must be greater than 0.")
+        return self
+
+
+class AIAgentsConfig(BaseModel):
+    api_timeout_sec: int = Field(..., gt=0)
+    sim_guidance_strength: float = Field(..., ge=0.0, le=1.0)
+
+class FullConfig(BaseModel):
+    system: SystemConfig
+    ga: GAConfig
+    hnn: HNNConfig
+    ai_agents: AIAgentsConfig
+
+    @model_validator(mode='after')
+    def check_quantization_bits_support(self) -> 'FullConfig':
+        if 4 in self.hnn.supported_quantization_bits and not torch.cuda.is_available():
+            logger.warning("4-bit quantization selected but CUDA is not available. It will not be effectively used.",
+                           config_path="config.yaml") # Pridėtas kontekstas
+        return self
+
+
+def load_config(config_path: str = "config.yaml") -> FullConfig:
+    """Įkelia ir validuoja konfigūraciją iš YAML failo."""
+    try:
+        with open(config_path, 'r') as f:
+            config_data = yaml.safe_load(f)
+        config = FullConfig.model_validate(config_data)
+        return config
+    except FileNotFoundError:
+        # Pakeistas logingo lygis, nes tai kritinė klaida, kuriai nėra loggerio konfigūracijos.
+        # Spausdiname į stderr ir keliame išimtį.
+        print(f"ERROR: Konfigūracijos failas '{config_path}' nerastas.", file=sys.stderr)
+        raise
+    except ValidationError as e:
+        print(f"ERROR: Konfigūracijos validavimo klaida: {e.errors()}", file=sys.stderr)
+        raise
+    except Exception as e:
+        print(f"ERROR: Klaida įkeliant konfigūraciją: {e}", file=sys.stderr)
+        raise
+
+_global_logger_initialized = False
+logger = structlog.get_logger() # Pradinis loggeris, kol nekonfigūruotas
+
+def setup_logging(config: FullConfig):
+    """Konfigūruoja išsamų struktūrizuotą logavimą."""
+    global _global_logger_initialized
+    if _global_logger_initialized:
+        return
+
+    log_filename = f"{config.system.log_file_prefix}_{int(time.time())}.log"
+    
+    root_logger = logging.getLogger()
+    root_logger.setLevel(getattr(logging, config.system.log_level.upper()))
+    
+    file_handler = logging.FileHandler(log_filename, mode='w')
+    file_handler.setFormatter(structlog.stdlib.ProcessorFormatter(
+        processor=structlog.processors.JSONRenderer(),
+        foreign_pre_chain=[
+            structlog.stdlib.add_logger_name,
+            structlog.stdlib.add_log_level,
+            structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S", utc=False),
+            structlog.processors.StackInfoRenderer(),
+        ]
+    ))
+    root_logger.addHandler(file_handler)
+    
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(structlog.stdlib.ProcessorFormatter(
+        processor=structlog.dev.ConsoleRenderer(),
+        foreign_pre_chain=[
+            structlog.stdlib.add_logger_name,
+            structlog.stdlib.add_log_level,
+            structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S", utc=False),
+            structlog.processors.StackInfoRenderer(),
+        ]
+    ))
+    root_logger.addHandler(console_handler)
+
+    structlog.configure(
+        processors=[
+            structlog.stdlib.add_logger_name,
+            structlog.stdlib.add_log_level,
+            structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S", utc=False),
+            structlog.processors.StackInfoRenderer(),
+            structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
+        ],
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        wrapper_class=structlog.stdlib.BoundLogger,
+        cache_logger_on_first_use=True,
+    )
+
+    global logger
+    logger = structlog.get_logger()
+    _global_logger_initialized = True
+    
+    logger.info("Logavimas nustatytas.", log_file=log_filename, log_level=config.system.log_level.upper())
+
+
+# --- Pagalbinės Funkcijos ir Stebėsenos Įrankiai ---
+def get_current_vram_usage_mb(genome_id: str = "N/A") -> float:
+    """
+    Grąžina dabartinį VRAM naudojimą MB (alokuota + rezervuota atmintis).
+    Tai geresnis rodiklis nei tik allocated, nes parodo realų PyTorch užimtą VRAM kiekį.
+    """
+    if torch.cuda.is_available():
+        # memory_allocated() rodo realiai dabar naudojamą atmintį
+        # memory_reserved() rodo, kiek atminties PyTorch yra rezervavęs ateičiai (talpykla)
+        # Bendra suma geriau atspindi VRAM apkrovą, kuri gali sukelti OOM klaidas.
+        allocated_bytes = torch.cuda.memory_allocated()
+        reserved_bytes = torch.cuda.memory_reserved()
+        total_vram_usage = (allocated_bytes + reserved_bytes) / (1024 ** 2)
+        logger.debug("VRAM naudojimas", genome_id=genome_id, allocated_mb=f"{allocated_bytes / (1024**2):.2f}",
+                     reserved_mb=f"{reserved_bytes / (1024**2):.2f}", total_mb=f"{total_vram_usage:.2f}")
+        return total_vram_usage
+    else:
+        logger.warning("CUDA neprieinama. VRAM naudojimas negali būti stebimas realiu laiku.", genome_id=genome_id)
+        return 0.0
+
+def check_vram_limit(operation_name: str, genome_id: str, config: FullConfig) -> bool:
+    """Patikrina VRAM naudojimą ir logina. Grąžina False, jei limitas viršytas."""
+    current_vram = get_current_vram_usage_mb(genome_id)
+    if current_vram > config.system.vram_limit_mb:
+        logger.error("VRAM limitas viršytas!", genome_id=genome_id, operation=operation_name,
+                     current_vram_mb=f"{current_vram:.2f}", limit_mb=config.system.vram_limit_mb)
+        return False
+    else:
+        logger.info("VRAM naudojimas", genome_id=genome_id, operation=operation_name,
+                    current_vram_mb=f"{current_vram:.2f}", limit_mb=config.system.vram_limit_mb)
+        return True
+
+# --- Genomo Apibrėžimas ---
+class Genome:
+    """
+    Genomas – visos GeneticArchitect sistemos "brėžinys".
+    Visi sistemos parametrai, kuriuos evoliucionuoja GA, yra čia.
+    """
+    def __init__(self, genome_id: str = None, config: FullConfig = None):
+        self.id = genome_id if genome_id else str(uuid.uuid4())
+        self.config = config if config else current_config
+        self.fitness: float = -float('inf')
+        self.vram_used_mb: float = 0.0
+        self.hnn_mse_loss: float = float('inf')
+        self.compression_ratio: float = 0.0
+
+        # HNN Architektūros parametrai (GA evoliucionuoja)
+        # Užtikriname, kad latent_dim_flat inicializacija atitiktų konfigūracijos diapazoną
+        min_ld, max_ld = self.config.hnn.latent_dim_mutation_range
+        initial_latent_dim = random.randint(min_ld, max_ld)
+
+        self.hnn_architecture: Dict[str, Any] = {
+            "latent_dim_flat": initial_latent_dim, # Naudojame iš mutacijos diapazono
+            "quantization_bits": random.choice(self.config.hnn.supported_quantization_bits),
+            "encoder_layers": [
+                {"type": "linear", "out_features": random.randint(32, 64), "activation": "GELU"},
+                {"type": "linear", "out_features": initial_latent_dim, "activation": "None"} # Paskutinis sluoksnis į latentinį matmenį
+            ],
+            "decoder_layers": [
+                {"type": "linear", "out_features": random.randint(32, 64), "activation": "GELU"},
+                {"type": "linear", "out_features": self.config.system.binance_data_points, "activation": "None"}
+            ]
+        }
+        # Papildoma validacija, kad encoder_layers ir decoder_layers nebūtų tušti
+        assert len(self.hnn_architecture["encoder_layers"]) > 0, "Encoder layers list cannot be empty."
+        assert len(self.hnn_architecture["decoder_layers"]) > 0, "Decoder layers list cannot be empty."
+        
+        # AI Agentų Sąveikos parametrai (GA evoliucionuoja)
+        self.ai_agent_weights: Dict[str, float] = {
+            "gemini_influence": random.uniform(0.1, 1.0),
+            "grok_influence": random.uniform(0.1, 1.0),
+            "deepseek_influence": random.uniform(0.1, 1.0)
+        }
+        self.ai_query_strategy: str = random.choice(["sentiment", "architecture_advice", "resource_optimization"])
+
+        # VRAM Valdymo strategijos (GA evoliucionuoja)
+        self.vram_optimization_strategy: str = random.choice(["aggressive_quant", "dynamic_resizing", "prioritize_speed"])
+        
+        # Fitneso Funkcijos svorio parametrai (GA evoliucionuoja SAVO PATIES tikslus!)
+        self.fitness_weights: Dict[str, float] = {
+            "hnn_accuracy": random.uniform(0.1, 1.0),
+            "vram_efficiency": random.uniform(0.1, 1.0),
+            "compression_ratio_impact": random.uniform(0.1, 1.0),
+            "ai_guidance_bonus": random.uniform(0.1, 1.0)
+        }
+        self._normalize_fitness_weights()
+
+    def _normalize_fitness_weights(self):
+        """Normalizuoja fitneso svorius, kad suma būtų ~1.0."""
+        total_weight = sum(self.fitness_weights.values())
+        if total_weight > 0:
+            for key in self.fitness_weights:
+                self.fitness_weights[key] /= total_weight
+        else:
+            logger.warning("Genomo fitneso svorių suma lygi nuliui, gali paveikti fitneso skaičiavimą.", genome_id=self.id)
+
+    def __repr__(self):
+        return (f"Genome(ID: {self.id[:8]}, Fitness: {self.fitness:.4f}, "
+                f"MSE: {self.hnn_mse_loss:.4f}, Comp: {self.compression_ratio:.2f}x, "
+                f"VRAM: {self.vram_used_mb:.2f}MB, QBits: {self.hnn_architecture['quantization_bits']})")
+
+# --- Homogeninės Sistemos Komponentai (Valdomi Genomo) ---
+
+# --- HNN statytojas ---
+class HNNBuilder:
+    @staticmethod
+    def _get_activation(name: str):
+        """Grąžina aktyvacijos funkcijos modulį."""
+        if name == "GELU":
+            return nn.GELU()
+        elif name == "ReLU":
+            return nn.ReLU()
+        elif name == "Sigmoid":
+            return nn.Sigmoid()
+        elif name == "None":
+            return nn.Identity()
+        else:
+            logger.warning("Nepalaikoma aktyvacijos funkcija. Naudojama Identity.", activation_name=name)
+            return nn.Identity()
+
+    @staticmethod
+    def build_model_from_genome(genome: Genome, input_dim: int, device: torch.device):
+        """
+        Sukuriama PyTorch HNN modelis pagal genomo aprašytą architektūrą.
+        """
+        logger.info("Kuriama HNN architektūra pagal genomą...", genome_id=genome.id)
+        
+        encoder_layers = []
+        current_dim = input_dim
+        for i, layer_def in enumerate(genome.hnn_architecture["encoder_layers"]):
+            if layer_def["type"] == "linear":
+                # Patikrinimas, ar sluoksnis su latent_dim_flat yra paskutinis encoder'yje.
+                # Jei ne, latent_dim_flat bus paskutinio encoder sluoksnio out_features.
+                # Jei tai ne paskutinis sluoksnis, tiesiog naudojame layer_def["out_features"]
+                if i == len(genome.hnn_architecture["encoder_layers"]) - 1:
+                    # Paskutinio encoder sluoksnio out_features turi sutapti su latent_dim_flat
+                    out_features = genome.hnn_architecture["latent_dim_flat"]
+                else:
+                    out_features = layer_def["out_features"]
+
+                encoder_layers.append(nn.Linear(current_dim, out_features))
+                current_dim = out_features
+                if layer_def["activation"] != "None":
+                    encoder_layers.append(HNNBuilder._get_activation(layer_def["activation"]))
+            logger.debug("Encoder layer", genome_id=genome.id, layer_idx=i, layer_def=layer_def)
+        encoder = nn.Sequential(*encoder_layers)
+
+        decoder_layers = []
+        current_dim = genome.hnn_architecture["latent_dim_flat"] # Decoderio įvestis yra latentinis matmuo
+        for i, layer_def in enumerate(genome.hnn_architecture["decoder_layers"]):
+            if layer_def["type"] == "linear":
+                # Paskutinio decoder sluoksnio out_features turi sutapti su originaliais duomenimis
+                if i == len(genome.hnn_architecture["decoder_layers"]) - 1:
+                    out_features = input_dim
+                else:
+                    out_features = layer_def["out_features"]
+
+                decoder_layers.append(nn.Linear(current_dim, out_features))
+                current_dim = out_features
+                if layer_def["activation"] != "None":
+                    decoder_layers.append(HNNBuilder._get_activation(layer_def["activation"]))
+            logger.debug("Decoder layer", genome_id=genome.id, layer_idx=i, layer_def=layer_def)
+        decoder = nn.Sequential(*decoder_layers)
+
+        model = HNN_Core(encoder, decoder, genome.hnn_architecture["latent_dim_flat"], genome.hnn_architecture["quantization_bits"], genome.id)
+        # Modelis perkeliamas į norimą įrenginį po kvantavimo (jei kvantavimas vyksta CPU)
+        model.to(device) 
+        logger.info("HNN modelis sukurtas.", genome_id=genome.id, quantization_bits=genome.hnn_architecture['quantization_bits'])
+        return model
+
+# --- HNN Branduolys (Encoder ir Decoder) ---
+class HNN_Core(nn.Module):
+    def __init__(self, encoder: nn.Module, decoder: nn.Module, latent_dim: int, quantization_bits: int, genome_id: str):
+        super(HNN_Core, self).__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.latent_dim = latent_dim
+        self.quantization_bits = quantization_bits
+        self.genome_id = genome_id
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # Nustatome prietaisą čia
+        
+        self._apply_quantization()
+        # check_vram_limit čia nekviečiamas, nes modelis dar nebuvo perkeltas į GPU po kvantavimo,
+        # ir atminties naudojimas bus tikrinamas evaluate_genome funkcijoje po modelio to(device).
+
+    # Helper metodas rasti tėvinį modulį pagal pavadinimą, reikalingas bitsandbytes
+    def _get_parent_module(self, name: str) -> nn.Module:
+        parts = name.split('.')
+        parent = self
+        for part in parts[:-1]:
+            parent = getattr(parent, part)
+        return parent
+
+    def _apply_quantization(self):
+        """Taikomas dinaminis kvantavimas modeliui."""
+        current_device = next(self.parameters(), None).device
+        if current_device is None: # Modulis dar neturi parametrų (tuščias)
+            current_device = self.device # Naudojame numatytą prietaisą
+
+        if self.quantization_bits == 8:
+            if current_device.type == 'cuda':
+                logger.warning("8-bitų dinaminis kvantavimas su PyTorch veikia efektyviausiai CPU. Modelis laikinai perkeltas į CPU.", genome_id=self.genome_id)
+                self.cpu() # Perkeliame modelį į CPU prieš kvantavimą
+            try:
+                self.encoder = torch.quantization.quantize_dynamic(
+                    self.encoder, {nn.Linear}, dtype=torch.qint8
+                )
+                self.decoder = torch.quantization.quantize_dynamic(
+                    self.decoder, {nn.Linear}, dtype=torch.qint8
+                )
+                logger.info("HNN modelis dinamiškai kvantuotas į int8.", genome_id=self.genome_id)
+            except Exception as e:
+                logger.error("Nepavyko atlikti dinaminio int8 kvantavimo. Modelis paliktas float32.",
+                             genome_id=self.genome_id, error=str(e), exc_info=True)
+            finally:
+                # Svarbu: po kvantavimo, jei modelis buvo perkeltas į CPU, jis turi būti grąžintas atgal
+                # į `device`, kurį nustatė GeneticArchitect.
+                # Tai daroma HNNBuilder.build_model_from_genome po kvantavimo.
+                pass 
+        elif self.quantization_bits == 16:
+            self.half() # Konvertuoja visą modelį į float16
+            logger.info("HNN modelis konvertuotas į float16 (pusiau tikslumas).", genome_id=self.genome_id)
+        elif self.quantization_bits == 4:
+            try:
+                import bitsandbytes as bnb
+                if torch.cuda.is_available():
+                    logger.info("Bandoma taikyti 4-bitų kvantavimą su bitsandbytes. Modelis bus perkeltas į GPU.", genome_id=self.genome_id)
+                    # Svarbu: norint keisti modulius, reikia pereiti per named_modules ir pakeisti juos tėviniuose moduluose
+                    # Šis metodas naudoja tiesioginį modulio pakeitimą naudojant setattr, kuris yra saugesnis nei bandymas pakeisti iteruojant
+                    for name, module in self.named_modules():
+                        if isinstance(module, nn.Linear):
+                            # Sukuriame naują bnb.nn.Linear4bit modulį
+                            new_module = bnb.nn.Linear4bit(
+                                module.in_features,
+                                module.out_features,
+                                bias=module.bias is not None,
+                                # BNB config_path
+                                # Apsvarstykite, ar norite naudoti LLM.int8() arba int4, priklausomai nuo Jūsų specifikacijų
+                                # pavyzdžiui, `quant_type='nf4'` arba `quant_type='fp4'`
+                            )
+                            # Kopijuojame svorius iš originalaus modulio. BNB svoriai yra specialūs.
+                            new_module.weight = bnb.nn.Parameter4bit(module.weight.data, requires_grad=True, quant_type='nf4')
+                            if module.bias is not None:
+                                new_module.bias = nn.Parameter(module.bias.data.clone(), requires_grad=True)
+                            
+                            # Pakeičiame modulį tėviniame modulyje
+                            # pvz., self.encoder.0.weight -> encoder.0
+                            parent = self._get_parent_module(name)
+                            # Jei name yra "encoder.0", tai parts = ["encoder", "0"]. setattr(parent, "0", new_module)
+                            setattr(parent, name.split('.')[-1], new_module)
+                            logger.debug(f"Pakeistas {name} į bitsandbytes.nn.Linear4bit", genome_id=self.genome_id)
+                    logger.info("HNN modelis apdorotas 4-bitų kvantavimui (su bitsandbytes).", genome_id=self.genome_id)
+                else:
+                    logger.warning("CUDA neprieinama, 4-bitų kvantavimas su bitsandbytes praleistas.", genome_id=self.genome_id)
+            except ImportError:
+                logger.error("Biblioteka 'bitsandbytes' neįdiegta. 4-bitų kvantavimas neįmanomas. Modelis paliktas float32.",
+                             genome_id=self.genome_id, exc_info=True)
+            except Exception as e:
+                logger.error("Klaida taikant 4-bitų kvantavimą su bitsandbytes. Modelis paliktas float32.",
+                             genome_id=self.genome_id, error=str(e), exc_info=True)
+        else:
+            logger.info("Kvantavimas netaikomas. Modelis paliktas float32.", genome_id=self.genome_id)
+
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Praleidžia duomenis per Encoderį ir Decoderį."""
+        # Prietaisas nustatomas HNNBuilder, todėl tikriname, ar modelis jau perkeltas.
+        # Jei modelis buvo perkeltas į CPU dėl 8-bitų kvantavimo, jis bus perkeltas atgal į GPU prieš forward.
+        device = next(self.parameters()).device
+        x = x.to(device) # Užtikriname, kad duomenys būtų tame pačiame įrenginyje
+
+        # Užtikriname tinkamą duomenų tipą pagal kvantavimo nustatymus.
+        if self.quantization_bits == 16:
+            x = x.to(torch.float16)
+        # 8-bitų ir 4-bitų (su bitsandbytes) kvantavimas dažnai veikia su float32 įvestimi,
+        # o svoriai yra kvantuoti. Todėl input data nereikia keisti.
+        else: # Default float32, jei ne 16 bitų ir ne efektyvus 8/4 bitų
+            x = x.to(torch.float32)
+
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+
+        return encoded, decoded
+
+# --- Binance Duomenų Tiekėjas (simuliuojamas) ---
+class BinanceStreamManager:
+    """
+    Simuliuoja Binance duomenų srautą.
+    """
+    def __init__(self, genome_id: str):
+        self.genome_id = genome_id
+        logger.info("BinanceStreamManager inicializuotas (simuliacinis režimas).", genome_id=self.genome_id)
+
+    def get_simulated_data(self, num_points: int) -> torch.Tensor:
+        """Grąžina simuliuotus Binance duomenis."""
+        data = torch.randn(1, num_points) # Batch=1
+        logger.debug("Sugeneruoti simuliuoti Binance duomenų taškai.", genome_id=self.genome_id, num_points=num_points, data_shape=data.shape)
+        return data
+
+# --- AI Agentų Valdymas (simuliuojamas) ---
+class AIAgentsManager:
+    """
+    Valdo sąveiką su išoriniais AI agentais (Gemini, Grok, DeepSeek). Simuliacija.
+    """
+    def __init__(self, genome_id: str, config: FullConfig):
+        self.genome_id = genome_id
+        self.config = config
+        logger.info("AIAgentsManager inicializuotas (simuliacinis režimas).", genome_id=self.genome_id)
+
+    async def query_ai_agent(self, agent_name: str, query_strategy: str) -> Dict[str, Any]:
+        """
+        Simuliuoja užklausą AI agentui ir grąžina atsakymą.
+        """
+        logger.info("Klausiama AI agento...", genome_id=self.genome_id, agent_name=agent_name, strategy=query_strategy)
+        await asyncio.sleep(random.uniform(0.1, 0.5)) # Simuliuojamas API užklausos laikas
+
+        response = {
+            "status": "success",
+            "sentiment_score": random.uniform(-1.0, 1.0),
+            "architecture_advice_score": random.uniform(0.0, 1.0),
+            "resource_optimization_advice_score": random.uniform(0.0, 1.0),
+            "raw_response": f"Simuliuotas atsakymas iš {agent_name} apie {query_strategy}.",
+            "query_time_sec": random.uniform(0.1, 0.5)
+        }
+        logger.info("Gautas simuliuotas atsakymas iš AI agento.", genome_id=self.genome_id, agent_name=agent_name, response_status=response["status"])
+        return response
+
+# --- Genetic Architect: Pagrindinis Evoliucijos Variklis ---
+class GeneticArchitect:
+    def __init__(self, config: FullConfig):
+        self.config = config
+        self.population: List[Genome] = []
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logger.info("GeneticArchitect inicializuotas.", device=self.device)
+        
+        for _ in range(self.config.ga.population_size):
+            self.population.append(Genome(config=self.config))
+        logger.info("Populiacija inicializuota.", population_size=len(self.population))
+
+    async def evaluate_genome(self, genome: Genome):
+        """
+        Įvertina vieną genomą, įgyvendindamas visas jo apibrėžtas sistemos dalis.
+        VRAM ir kompresija yra tikrinami realiu laiku.
+        """
+        logger.info("Pradedamas genomo vertinimas", genome_id=genome.id)
+        
+        # Talpyklos valymas prieš genomo vertinimą, ne per dažnai
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            logger.info("CUDA cache išvalyta prieš HNN kūrimą.", genome_id=genome.id)
+
+        hnn_model = None
+        data = None
+        encoded = None
+        decoded = None
+
+        try:
+            hnn_model = HNNBuilder.build_model_from_genome(
+                genome=genome,
+                input_dim=self.config.system.binance_data_points,
+                device=self.device # Nurodome įrenginį čia
+            )
+
+            # Po modelio sukūrimo ir perkėlimo į įrenginį, tikriname VRAM
+            if not check_vram_limit("HNN modelio kūrimas", genome.id, self.config):
+                raise MemoryError(f"VRAM limitas viršytas HNN modelio kūrimo etape {genome.id}")
+
+
+            binance_manager = BinanceStreamManager(genome.id)
+            data = binance_manager.get_simulated_data(self.config.system.binance_data_points)
+
+            optimizer = torch.optim.Adam(hnn_model.parameters(), lr=0.001)
+            criterion = nn.MSELoss()
+
+            for epoch in range(self.config.hnn.training_epochs):
+                optimizer.zero_grad()
+                # VRAM patikrinimas prieš kiekvieną forward pass
+                if not check_vram_limit(f"HNN Treniravimas Epocha {epoch+1} - Prieš Forward", genome.id, self.config):
+                    raise MemoryError(f"VRAM limitas viršytas prieš forward pasą {genome.id}")
+
+                encoded, decoded = hnn_model(data)
+                
+                # VRAM patikrinimas po kiekvieno forward pass
+                if not check_vram_limit(f"HNN Treniravimas Epocha {epoch+1} - Po Forward", genome.id, self.config):
+                    raise MemoryError(f"VRAM limitas viršytas po forward paso {genome.id}")
+
+                loss = criterion(decoded, data.to(self.device)) # Užtikriname, kad target data būtų tame pačiame įrenginyje
+                loss.backward()
+                optimizer.step()
+                logger.debug("HNN treniravimas", genome_id=genome.id, epoch=epoch+1, total_epochs=self.config.hnn.training_epochs, loss=f"{loss.item():.6f}")
+                
+            genome.hnn_mse_loss = loss.item()
+            logger.info("HNN treniravimas baigtas.", genome_id=genome.id, final_mse_loss=f"{genome.hnn_mse_loss:.6f}")
+
+            # Kompresijos Laipsnio Apskaičiavimas
+            input_size_bytes = self.config.system.binance_data_points * 4 # num_points * float32_size
+            
+            # Šis skaičiavimas yra apytikslis ir priklauso nuo to, ką laikome "kompresija".
+            # Jei latentinis matmuo yra kvantuojamas (t.y. jo elementai), tada jo dydis mažėja.
+            # Pvz., jei latentinis vektorius būtų saugomas su 4 bitų tikslumu:
+            latent_size_bytes_per_value = genome.hnn_architecture["quantization_bits"] / 8.0
+            # Apskaičiuojame latentinio vektoriaus dydį, jei jis būtų saugomas su atitinkamu tikslumu.
+            # Tai atspindi potencialią informacijos kompresiją per latentinį vaizdą.
+            # Svarbu: `encoded` tenzorius po kodavimo vis dar bus float32/float16, ne kvantuotas int4/int8.
+            # Taigi, jei kalbame apie VRAM aktyvacijų kompresiją, tai yra sudėtingiau.
+            # Šis skaičiavimas labiau atspindi modelio svorių kompresiją.
+            # Kadangi "Holographic Neural Network" rodo į "hologram" (suspaustą atvaizdą),
+            # tai galima interpretuoti kaip latentinio vaizdo informacijos tankį.
+            latent_size_bytes = genome.hnn_architecture["latent_dim_flat"] * latent_size_bytes_per_value
+
+            if latent_size_bytes > 0:
+                genome.compression_ratio = input_size_bytes / latent_size_bytes
+            else:
+                genome.compression_ratio = 0.0 # Išvengti dalijimo iš nulio
+            logger.info("Kompresijos skaičiavimai.", genome_id=genome.id, input_size_bytes=input_size_bytes,
+                                 latent_size_bytes=f"{latent_size_bytes:.2f}", compression_ratio=f"{genome.compression_ratio:.2f}x")
+
+            # AI Agentų Konsultacijos
+            ai_manager = AIAgentsManager(genome.id, self.config)
+            ai_responses = {}
+            if genome.ai_agent_weights["gemini_influence"] > 0:
+                ai_responses['gemini'] = await ai_manager.query_ai_agent("Gemini", genome.ai_query_strategy)
+            if genome.ai_agent_weights["grok_influence"] > 0:
+                ai_responses['grok'] = await ai_manager.query_ai_agent("Grok", genome.ai_query_strategy)
+            if genome.ai_agent_weights["deepseek_influence"] > 0:
+                ai_responses['deepseek'] = await ai_manager.query_ai_agent("DeepSeek", genome.ai_query_strategy)
+
+            # Fitneso Apskaičiavimas
+            genome.vram_used_mb = get_current_vram_usage_mb(genome.id)
+
+            accuracy_score = max(0, 1.0 - genome.hnn_mse_loss / 10.0) # Normalizavimas
+            vram_score = max(0, 1.0 - genome.vram_used_mb / self.config.system.vram_limit_mb)
+            # Apsvarstykite normalizuoti compression_score pagal numatomą maksimalų santykį
+            compression_score = genome.compression_ratio / 100.0 if genome.compression_ratio > 0 else 0
+            
+            ai_bonus = 0.0
+            for agent, response in ai_responses.items():
+                if response['status'] == 'success':
+                    if genome.ai_query_strategy == "architecture_advice":
+                        ai_bonus += response['architecture_advice_score'] * genome.ai_agent_weights[f"{agent}_influence"]
+                    elif genome.ai_query_strategy == "sentiment":
+                        ai_bonus += (response['sentiment_score'] + 1.0) / 2.0 * genome.ai_agent_weights[f"{agent}_influence"]
+                    else: # resource_optimization
+                        ai_bonus += (response['resource_optimization_advice_score'] + 0.5) * genome.ai_agent_weights[f"{agent}_influence"]
+            ai_bonus = min(1.0, ai_bonus) # Apribojame AI bonusą iki 1.0
+
+            genome.fitness = (
+                accuracy_score * genome.fitness_weights["hnn_accuracy"] +
+                vram_score * genome.fitness_weights["vram_efficiency"] +
+                compression_score * genome.fitness_weights["compression_ratio_impact"] +
+                ai_bonus * genome.fitness_weights["ai_guidance_bonus"]
+            )
+            logger.info("Fitneso komponentai ir galutinis fitnesas.",
+                                 genome_id=genome.id,
+                                 accuracy_score=f"{accuracy_score:.4f}",
+                                 vram_score=f"{vram_score:.4f}",
+                                 compression_score=f"{compression_score:.4f}",
+                                 ai_bonus=f"{ai_bonus:.4f}",
+                                 final_fitness=f"{genome.fitness:.4f}")
+
+        except MemoryError as e:
+            logger.error("Kritinė klaida dėl VRAM. Genomo fitnesas nustatomas į -inf.",
+                                 genome_id=genome.id, error=str(e), exc_info=True)
+            genome.fitness = -float('inf')
+            genome.vram_used_mb = self.config.system.vram_limit_mb + 1 # Kad aiškiai matytųsi viršijimas
+            raise # Svarbu re-kelti, kad asyncio.gather galėtų sugauti
+        except Exception as e:
+            logger.error("Nepavyko įvertinti genomo dėl netikėtos klaidos.",
+                                 genome_id=genome.id, error=str(e), exc_info=True)
+            genome.fitness = -float('inf')
+            raise # Svarbu re-kelti, kad asyncio.gather galėtų sugauti
+        finally:
+            # Svarbu atlaisvinti resursus po genomo vertinimo
+            if hnn_model is not None:
+                try:
+                    hnn_model.cpu() # Perkeliame į CPU prieš trynimą
+                    del hnn_model
+                except Exception as e:
+                    logger.warning(f"Klaida trinant HNN modelį po vertinimo: {e}", genome_id=genome.id)
+            
+            if data is not None: del data
+            if encoded is not None: del encoded
+            if decoded is not None: del decoded
+            
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                logger.info("CUDA cache išvalyta po genomo vertinimo.",
+                                     genome_id=genome.id, vram_after_cleanup=f"{get_current_vram_usage_mb(genome.id):.2f} MB")
+
+
+    async def evolve(self):
+        """Pagrindinė GA evoliucijos kilpa."""
+        logger.info("Pradedama GeneticArchitect evoliucija...")
+
+        for generation in range(self.config.ga.num_generations):
+            logger.info("===== Pradedama generacija =====", generation=generation + 1, total_generations=self.config.ga.num_generations)
+            
+            tasks = [self.evaluate_genome(genome) for genome in self.population]
+            
+            # Naudojame asyncio.gather su individualiu apdorojimu
+            # Nebe `return_exceptions=True`, o apdorojame kiekvieną task individualiai
+            # Kadangi evaluate_genome dabar kelia išimtis, šis blokas jas sugaus
+            evaluated_genomes_count = 0
+            for i, task in enumerate(tasks):
+                try:
+                    await task
+                    evaluated_genomes_count += 1
+                except MemoryError as e:
+                    logger.error(f"VRAM klaida vertinant genomą {self.population[i].id[:8]}: {e}")
+                    # Fitnesas ir VRAM jau nustatyti evaluate_genome
+                except Exception as e:
+                    logger.error(f"Kritinė klaida vertinant genomą {self.population[i].id[:8]}: {e}", exc_info=True)
+                    # Fitnesas ir VRAM jau nustatyti evaluate_genome
+            
+            logger.info("Genomų vertinimo santrauka.",
+                                 generation=generation + 1,
+                                 evaluated_successfully=evaluated_genomes_count,
+                                 total_in_population=len(self.population))
+
+            self.population.sort(key=lambda g: g.fitness, reverse=True)
+            
+            best_genome = self.population[0]
+            worst_genome = self.population[-1]
+            logger.info("Generacijos rezultatai.",
+                                 generation=generation + 1,
+                                 best_fitness=f"{best_genome.fitness:.4f}",
+                                 worst_fitness=f"{worst_genome.fitness:.4f}",
+                                 best_genome_id=best_genome.id[:8])
+
+            new_population = []
+            new_population.append(copy.deepcopy(self.population[0])) # Elitizmas, naudoti deepcopy
+            # Apsvarstykite, ar elitas turi būti vertinamas iš naujo ar ne. Jei elitas nukopijuojamas,
+            # jo fitnesas išlieka.
+
+            while len(new_population) < self.config.ga.population_size:
+                parent1 = random.choice(self.population[:self.config.ga.population_size // 2])
+                parent2 = random.choice(self.population[:self.config.ga.population_size // 2])
+
+                child1, child2 = self.crossover(parent1, parent2)
+                
+                self.mutate(child1)
+                self.mutate(child2)
+
+                new_population.append(child1)
+                if len(new_population) < self.config.ga.population_size:
+                    new_population.append(child2)
+                
+            self.population = new_population
+            logger.info("Generacija baigta. Nauja populiacija sukurta.", generation=generation + 1)
+
+        logger.info("GeneticArchitect evoliucija baigta.")
+        logger.info("Galutinis geriausias genomas:", best_genome=self.population[0].__repr__())
+
+    def crossover(self, parent1: Genome, parent2: Genome) -> Tuple[Genome, Genome]:
+        """Atlieka kryžminimą tarp dviejų genomų."""
+        child1 = Genome(config=self.config)
+        child2 = Genome(config=self.config)
+
+        if random.random() < self.config.ga.crossover_rate:
+            # HNN architektūros kryžminimas
+            # Svarbu naudoti copy.deepcopy, kad sluoksnių konfigūracijos būtų nepriklausomos
+            # ir jų mutacijos neturėtų įtakos kitiems genomams.
+            
+            # Encoder sluoksniai
+            # Patikriname, ar sąrašai nėra tušti, kad išvengtume klaidų su random.randint(0, -1)
+            crossover_point_enc = random.randint(0, len(parent1.hnn_architecture["encoder_layers"])) if parent1.hnn_architecture["encoder_layers"] else 0
+
+            child1.hnn_architecture["encoder_layers"] = copy.deepcopy(parent1.hnn_architecture["encoder_layers"][:crossover_point_enc]) + \
+                                                       copy.deepcopy(parent2.hnn_architecture["encoder_layers"][crossover_point_enc:])
+            child2.hnn_architecture["encoder_layers"] = copy.deepcopy(parent2.hnn_architecture["encoder_layers"][:crossover_point_enc]) + \
+                                                       copy.deepcopy(parent1.hnn_architecture["encoder_layers"][crossover_point_enc:])
+
+            # Decoder sluoksniai
+            crossover_point_dec = random.randint(0, len(parent1.hnn_architecture["decoder_layers"])) if parent1.hnn_architecture["decoder_layers"] else 0
+
+            child1.hnn_architecture["decoder_layers"] = copy.deepcopy(parent1.hnn_architecture["decoder_layers"][:crossover_point_dec]) + \
+                                                       copy.deepcopy(parent2.hnn_architecture["decoder_layers"][crossover_point_dec:])
+            child2.hnn_architecture["decoder_layers"] = copy.deepcopy(parent2.hnn_architecture["decoder_layers"][:crossover_point_dec]) + \
+                                                       copy.deepcopy(parent1.hnn_architecture["decoder_layers"][crossover_point_dec:])
+
+            # Latentinis matmuo ir kvantavimo bitai
+            child1.hnn_architecture["latent_dim_flat"] = random.choice([parent1.hnn_architecture["latent_dim_flat"], parent2.hnn_architecture["latent_dim_flat"]])
+            child2.hnn_architecture["latent_dim_flat"] = random.choice([parent1.hnn_architecture["latent_dim_flat"], parent2.hnn_architecture["latent_dim_flat"]])
+            
+            # Užtikriname, kad vaiko quantization_bits būtų palaikomas confige
+            child1.hnn_architecture["quantization_bits"] = random.choice([q_bit for q_bit in [parent1.hnn_architecture["quantization_bits"], parent2.hnn_architecture["quantization_bits"]] if q_bit in self.config.hnn.supported_quantization_bits])
+            if not child1.hnn_architecture["quantization_bits"]: # Jei pasirinkimas nepavyko, nustatome default
+                child1.hnn_architecture["quantization_bits"] = random.choice(self.config.hnn.supported_quantization_bits)
+
+            child2.hnn_architecture["quantization_bits"] = random.choice([q_bit for q_bit in [parent1.hnn_architecture["quantization_bits"], parent2.hnn_architecture["quantization_bits"]] if q_bit in self.config.hnn.supported_quantization_bits])
+            if not child2.hnn_architecture["quantization_bits"]:
+                child2.hnn_architecture["quantization_bits"] = random.choice(self.config.hnn.supported_quantization_bits)
+
+        # AI svorių ir fitneso svorių kryžminimas
+        for key in parent1.ai_agent_weights:
+            child1.ai_agent_weights[key] = random.choice([parent1.ai_agent_weights[key], parent2.ai_agent_weights[key]])
+            child2.ai_agent_weights[key] = random.choice([parent1.ai_agent_weights[key], parent2.ai_agent_weights[key]])
+        
+        for key in parent1.fitness_weights:
+            child1.fitness_weights[key] = random.choice([parent1.fitness_weights[key], parent2.fitness_weights[key]])
+            child2.fitness_weights[key] = random.choice([parent1.fitness_weights[key], parent2.fitness_weights[key]])
+        
+        child1._normalize_fitness_weights()
+        child2._normalize_fitness_weights()
+
+        logger.debug("Kryžminimas atliktas.", parent1_id=parent1.id[:8], parent2_id=parent2.id[:8],
+                              child1_id=child1.id[:8], child2_id=child2.id[:8])
+        return child1, child2
+
+    def mutate(self, genome: Genome):
+        """Atlieka mutaciją genomui."""
+        if random.random() < self.config.ga.mutation_rate:
+            logger.debug("Mutacija vykdoma genomui", genome_id=genome.id[:8])
+            
+            # Mutuojame latent_dim_flat
+            if random.random() < 0.5:
+                min_dim, max_dim = genome.config.hnn.latent_dim_mutation_range
+                genome.hnn_architecture["latent_dim_flat"] = random.randint(min_dim, max_dim)
+                # Atnaujiname ir paskutinį encoder sluoksnio out_features, kad atitiktų naują latent_dim_flat
+                if genome.hnn_architecture["encoder_layers"]:
+                    last_encoder_layer_idx = len(genome.hnn_architecture["encoder_layers"]) - 1
+                    genome.hnn_architecture["encoder_layers"][last_encoder_layer_idx]["out_features"] = genome.hnn_architecture["latent_dim_flat"]
+                logger.debug("Mutavo latent_dim_flat.", genome_id=genome.id[:8], new_value=genome.hnn_architecture['latent_dim_flat'])
+
+            # Mutuojame kvantavimo bitus
+            if random.random() < 0.3:
+                genome.hnn_architecture["quantization_bits"] = random.choice(self.config.hnn.supported_quantization_bits)
+                logger.debug("Mutavo quantization_bits.", genome_id=genome.id[:8], new_value=genome.hnn_architecture['quantization_bits'])
+
+            # Mutuojame AI svorius
+            if random.random() < 0.2:
+                key_to_mutate = random.choice(list(genome.ai_agent_weights.keys()))
+                genome.ai_agent_weights[key_to_mutate] = random.uniform(0.1, 1.0)
+                logger.debug("Mutavo AI svorį.", genome_id=genome.id[:8], key=key_to_mutate, new_value=f"{genome.ai_agent_weights[key_to_mutate]:.2f}")
+
+            # Mutuojame fitneso svorius
+            if random.random() < 0.2:
+                key_to_mutate = random.choice(list(genome.fitness_weights.keys()))
+                genome.fitness_weights[key_to_mutate] = random.uniform(0.1, 1.0)
+                genome._normalize_fitness_weights()
+                logger.debug("Mutavo fitneso svorį.", genome_id=genome.id[:8], key=key_to_mutate, new_value=f"{genome.fitness_weights[key_to_mutate]:.2f}")
+
+            # Mutuojame atskirų sluoksnių out_features (išskyrus paskutinius encoder/decoder)
+            if random.random() < 0.1:
+                # Mutuojame ne paskutinį encoder sluoksnį
+                if len(genome.hnn_architecture["encoder_layers"]) > 1: # Turi būti bent du sluoksniai
+                    layer_idx_to_mutate = random.randint(0, len(genome.hnn_architecture["encoder_layers"]) - 2)
+                    genome.hnn_architecture["encoder_layers"][layer_idx_to_mutate]["out_features"] = random.randint(32, 128)
+                    logger.debug("Mutavo encoder_layers out_features.", genome_id=genome.id[:8], layer_idx=layer_idx_to_mutate, new_value=genome.hnn_architecture['encoder_layers'][layer_idx_to_mutate]['out_features'])
+                
+                # Mutuojame ne paskutinį decoder sluoksnį
+                if len(genome.hnn_architecture["decoder_layers"]) > 1: # Turi būti bent du sluoksniai
+                    layer_idx_to_mutate = random.randint(0, len(genome.hnn_architecture["decoder_layers"]) - 2)
+                    genome.hnn_architecture["decoder_layers"][layer_idx_to_mutate]["out_features"] = random.randint(32, 128)
+                    logger.debug("Mutavo decoder_layers out_features.", genome_id=genome.id[:8], layer_idx=layer_idx_to_mutate, new_value=genome.hnn_architecture['decoder_layers'][layer_idx_to_mutate]['out_features'])
+            
+            # Mutacija - Pridėti/Pašalinti sluoksnius (struktūrinės mutacijos)
+            # Tai yra sudėtingesnė mutacija, reikalinga atidžiai valdyti įvesties/išvesties matmenis
+            if random.random() < 0.05: # Mažesnė tikimybė
+                if random.choice(["add", "remove"]) == "add":
+                    # Pridėti naują sluoksnį ENCODER'iui (ne paskutiniam)
+                    if len(genome.hnn_architecture["encoder_layers"]) < 5: # Ribojame max sluoksnių skaičių
+                        insert_idx = random.randint(0, len(genome.hnn_architecture["encoder_layers"]) - 1)
+                        # Naujo sluoksnio out_features gali būti bet koks, bet turi būti logiškas
+                        new_out_features = random.randint(16, 64)
+                        new_layer = {"type": "linear", "out_features": new_out_features, "activation": "GELU"}
+                        genome.hnn_architecture["encoder_layers"].insert(insert_idx, new_layer)
+                        logger.debug("Pridėtas naujas encoder sluoksnis.", genome_id=genome.id[:8], index=insert_idx, layer=new_layer)
+                else:
+                    # Pašalinti sluoksnį ENCODER'iui (ne paskutinį)
+                    if len(genome.hnn_architecture["encoder_layers"]) > 1: # Turi likti bent vienas sluoksnis (latentinis)
+                        remove_idx = random.randint(0, len(genome.hnn_architecture["encoder_layers"]) - 2) # Nepašaliname paskutinio sluoksnio
+                        removed_layer = genome.hnn_architecture["encoder_layers"].pop(remove_idx)
+                        logger.debug("Pašalintas encoder sluoksnis.", genome_id=genome.id[:8], index=remove_idx, layer=removed_layer)
+
+
+# --- Pagrindinė Vykdymo Funkcija ---
+current_config: Optional[FullConfig] = None
+
+async def main():
+    global current_config
+    try:
+        current_config = load_config()
+        # Logavimo sistema turi būti nustatyta po sėkmingo konfigūracijos įkėlimo.
+        setup_logging(current_config) 
+    except Exception as e:
+        # Jei konfigūracija nepavyko įkelti ar logavimas nustatyti, printinam į stderr ir išeinam.
+        # Spausdinu tik error, nes setup_logging ar load_config jau išspausdino detalizuotą pranešimą.
+        print(f"ERROR: Kritinė paleidimo klaida. Žiūrėti aukščiau esančius pranešimus.", file=sys.stderr)
+        sys.exit(1)
+
+    logger.info("--- Pradedamas GeneticArchitect sistemos vykdymas ---")
+    ga = GeneticArchitect(current_config)
+    await ga.evolve()
+    logger.info("--- GeneticArchitect sistemos vykdymas baigtas ---")
+
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -1,0 +1,412 @@
+# GROK 
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import random
+import uuid
+import math
+import asyncio
+from dataclasses import dataclass, field
+from typing import List, Dict, Tuple, Optional, Any
+import logging
+import time
+
+# --- Konfigūracija ir Globalūs Nustatymai ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+@dataclass
+class SystemConfig:
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    binance_data_points: int = 256
+    default_vram_limit_mb: int = 8000
+    supported_qat_bits: List[int] = field(default_factory=lambda: [4, 8, 16])
+
+# --- Genomo Apibrėžimas ---
+@dataclass
+class HNNLayer:
+    type: str = field(default_factory=lambda: random.choice(["linear", "conv", "dropout", "batch_norm", "max_pool", "avg_pool"]))
+    out_features: int = field(default_factory=lambda: random.randint(32, 256))
+    activation: str = field(default_factory=lambda: random.choice(["GELU", "ReLU", "Sigmoid", "None", "LeakyReLU", "Tanh"]))
+    dropout_rate: float = field(default_factory=lambda: random.uniform(0.1, 0.5))
+    kernel_size: int = field(default_factory=lambda: random.choice([3, 5]))
+    stride: int = field(default_factory=lambda: random.choice([1, 2]))
+
+@dataclass
+class Genome:
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    parent_ids: Tuple[Optional[str], Optional[str]] = (None, None)
+    generation: int = 0
+    fitness: float = 0.0
+    loss: float = float('inf')
+    accuracy: float = 0.0
+    compression_ratio: float = 0.0
+    vram_used_mb: float = 0.0
+
+    hnn_architecture: Dict[str, Any] = field(default_factory=lambda: {
+        "encoder_layers": [HNNLayer() for _ in range(random.randint(2, 5))],
+        "decoder_layers": [HNNLayer() for _ in range(random.randint(2, 5))],
+        "latent_dim_flat": random.randint(16, 128),
+    })
+
+    layer_bits: Dict[str, List[int]] = field(default_factory=dict)
+    qat_enabled: bool = field(default_factory=lambda: random.choice([True, False]))
+    training_epochs: int = field(default_factory=lambda: random.randint(5, 50))
+    learning_rate: float = field(default_factory=lambda: random.uniform(1e-4, 1e-2))
+    batch_size: int = field(default_factory=lambda: random.choice([32, 64, 128]))
+
+    fitness_weights: Dict[str, float] = field(default_factory=lambda: {
+        "hnn_accuracy": random.uniform(0.1, 1.0),
+        "vram_efficiency": random.uniform(0.1, 1.0),
+        "compression_ratio_impact": random.uniform(0.1, 1.0),
+        "ai_guidance_bonus": random.uniform(0.0, 0.5)
+    })
+    fitness_formula_type: str = field(default_factory=lambda: random.choice(["linear", "exponential", "multiplicative", "quadratic"]))
+
+    vram_limit_mb: int = field(default_factory=lambda: random.randint(2000, 10000))
+    min_time_between_vram_clears_sec: int = field(default_factory=lambda: random.randint(1, 10))
+    vram_warning_threshold: float = field(default_factory=lambda: random.uniform(0.6, 0.95))
+    large_bit_penalty_threshold: int = field(default_factory=lambda: random.randint(64, 256))
+    large_bit_penalty_factor: float = field(default_factory=lambda: random.uniform(0.3, 0.8))
+
+    def __post_init__(self):
+        self._initialize_dynamic_bits()
+        for section in ["encoder_layers", "decoder_layers"]:
+            for layer in self.hnn_architecture[section]:
+                if layer.type != "dropout":
+                    layer.dropout_rate = 0.0
+                if layer.type not in ["conv", "max_pool", "avg_pool"]:
+                    layer.kernel_size = 1
+                elif layer.kernel_size % 2 == 0:
+                    layer.kernel_size = max(3, layer.kernel_size - 1)
+
+    def _initialize_dynamic_bits(self):
+        self.layer_bits["encoder"] = [random.randint(1, 512) for _ in self.hnn_architecture["encoder_layers"]]
+        self.layer_bits["decoder"] = [random.randint(1, 512) for _ in self.hnn_architecture["decoder_layers"]]
+
+# --- HNN Modelis su Dinaminiu Kvantavimu ---
+class HNN_Core(nn.Module):
+    def __init__(self, encoder: nn.Module, decoder: nn.Module, latent_dim: int, genome: Genome, pre_flatten_shape: Tuple[int, int]):
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.latent_dim = latent_dim
+        self.genome = genome
+        self.pre_flatten_shape = pre_flatten_shape
+        self.device = torch.device(SystemConfig.device)
+        self.supported_qat_bits = SystemConfig.supported_qat_bits
+
+    def custom_quantize(self, tensor: torch.Tensor, bits: int) -> torch.Tensor:
+        if self.training and self.genome.qat_enabled and bits in self.supported_qat_bits:
+            return tensor
+        if bits >= 16:
+            if bits <= 16: return tensor.half()
+            elif bits <= 32: return tensor.float()
+            else: return tensor.double()
+        min_val = tensor.min()
+        max_val = tensor.max()
+        if min_val == max_val: return tensor
+        scale = (max_val - min_val) / (2**bits - 1)
+        q_tensor = torch.clamp(torch.round((tensor - min_val) / scale), 0, 2**bits - 1)
+        return q_tensor * scale + min_val
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if len(x.shape) == 2:
+            x = x.unsqueeze(1)
+        encoded = x
+        for i, layer_module in enumerate(self.encoder):
+            if i < len(self.genome.layer_bits["encoder"]) and isinstance(layer_module, (nn.Linear, nn.Conv1d)):
+                bits = self.genome.layer_bits["encoder"][i]
+                encoded = self.custom_quantize(encoded, bits)
+            encoded = layer_module(encoded)
+        decoded = encoded
+        for i, layer_module in enumerate(self.decoder):
+            if i < len(self.genome.layer_bits["decoder"]) and isinstance(layer_module, (nn.Linear, nn.Conv1d)):
+                bits = self.genome.layer_bits["decoder"][i]
+                decoded = self.custom_quantize(decoded, bits)
+            decoded = layer_module(decoded)
+        if len(decoded.shape) == 3:
+            decoded = decoded.squeeze(1) if decoded.shape[1] == 1 else decoded.view(decoded.shape[0], -1)
+        return encoded, decoded
+
+# --- HNN Modelio Statytojas ---
+class HNNBuilder:
+    @staticmethod
+    def _get_activation(name: str) -> nn.Module:
+        activations = {
+            "GELU": nn.GELU(), "ReLU": nn.ReLU(), "Sigmoid": nn.Sigmoid(),
+            "None": nn.Identity(), "LeakyReLU": nn.LeakyReLU(), "Tanh": nn.Tanh()
+        }
+        return activations.get(name, nn.Identity())
+
+    @staticmethod
+    def calculate_output_dim(input_len: int, kernel_size: int, stride: int, padding: int, output_padding: int = 0, dilation: int = 1) -> int:
+        return (input_len - 1) * stride - 2 * padding + dilation * (kernel_size - 1) + output_padding + 1
+
+    @staticmethod
+    def build_model_from_genome(genome: Genome, input_dim: int, device: torch.device) -> HNN_Core:
+        encoder_modules = []
+        current_channels = 1
+        current_len = input_dim
+        for layer_def in genome.hnn_architecture["encoder_layers"]:
+            padding = layer_def.kernel_size // 2
+            if layer_def.type == "linear":
+                encoder_modules.append(nn.Linear(current_channels * current_len, layer_def.out_features))
+                current_len = 1
+                current_channels = layer_def.out_features
+            elif layer_def.type == "conv":
+                encoder_modules.append(nn.Conv1d(current_channels, layer_def.out_features, layer_def.kernel_size, layer_def.stride, padding))
+                current_len = HNNBuilder.calculate_output_dim(current_len, layer_def.kernel_size, layer_def.stride, padding)
+                current_channels = layer_def.out_features
+            elif layer_def.type == "dropout":
+                encoder_modules.append(nn.Dropout(layer_def.dropout_rate))
+            elif layer_def.type == "batch_norm":
+                encoder_modules.append(nn.BatchNorm1d(current_channels))
+            elif layer_def.type == "max_pool":
+                encoder_modules.append(nn.MaxPool1d(layer_def.kernel_size, layer_def.stride, padding))
+                current_len = HNNBuilder.calculate_output_dim(current_len, layer_def.kernel_size, layer_def.stride, padding)
+            elif layer_def.type == "avg_pool":
+                encoder_modules.append(nn.AvgPool1d(layer_def.kernel_size, layer_def.stride, padding))
+                current_len = HNNBuilder.calculate_output_dim(current_len, layer_def.kernel_size, layer_def.stride, padding)
+            if layer_def.activation != "None":
+                encoder_modules.append(HNNBuilder._get_activation(layer_def.activation))
+        pre_flatten_shape = (current_channels, current_len)
+        encoder_modules.append(nn.Flatten())
+        encoder_modules.append(nn.Linear(current_channels * current_len, genome.hnn_architecture["latent_dim_flat"]))
+        encoder = nn.Sequential(*encoder_modules)
+
+        decoder_modules = []
+        decoder_modules.append(nn.Linear(genome.hnn_architecture["latent_dim_flat"], pre_flatten_shape[0] * pre_flatten_shape[1]))
+        decoder_modules.append(nn.Unflatten(1, pre_flatten_shape))
+        current_channels, current_len = pre_flatten_shape
+        for layer_def in genome.hnn_architecture["decoder_layers"]:
+            padding = layer_def.kernel_size // 2
+            output_padding = layer_def.stride - 1
+            if layer_def.type == "linear":
+                decoder_modules.append(nn.Linear(current_channels * current_len, layer_def.out_features))
+                current_len = 1
+                current_channels = layer_def.out_features
+            elif layer_def.type == "conv":
+                decoder_modules.append(nn.ConvTranspose1d(current_channels, layer_def.out_features, layer_def.kernel_size, layer_def.stride, padding, output_padding))
+                current_len = HNNBuilder.calculate_output_dim(current_len, layer_def.kernel_size, layer_def.stride, padding, output_padding)
+                current_channels = layer_def.out_features
+            elif layer_def.type == "dropout":
+                decoder_modules.append(nn.Dropout(layer_def.dropout_rate))
+            elif layer_def.type == "batch_norm":
+                decoder_modules.append(nn.BatchNorm1d(current_channels))
+            elif layer_def.type == "max_pool" or layer_def.type == "avg_pool":
+                decoder_modules.append(nn.Upsample(scale_factor=layer_def.stride))
+                current_len *= layer_def.stride
+            if layer_def.activation != "None":
+                decoder_modules.append(HNNBuilder._get_activation(layer_def.activation))
+        decoder_modules.append(nn.Conv1d(current_channels, 1, kernel_size=1))
+        decoder = nn.Sequential(*decoder_modules)
+        model = HNN_Core(encoder, decoder, genome.hnn_architecture["latent_dim_flat"], genome, pre_flatten_shape)
+        return model.to(device)
+
+# --- Genetinis Algoritmas ---
+class GeneticArchitect:
+    def __init__(self, config: SystemConfig, initial_input_dim: int):
+        self.config = config
+        self.population: List[Genome] = []
+        self.initial_input_dim = initial_input_dim
+        self.last_vram_clear_time = time.time()
+
+    async def initialize_population(self, population_size: int):
+        self.population = [Genome() for _ in range(population_size)]
+        logger.info(f"Populiacija inicializuota su {population_size} genomų.")
+
+    def _check_vram_limit(self, genome: Genome):
+        torch.cuda.empty_cache()
+        allocated_vram = torch.cuda.memory_allocated(0) / (1024 ** 2)
+        reserved_vram = torch.cuda.memory_reserved(0) / (1024 ** 2)
+        genome.vram_used_mb = allocated_vram
+        if reserved_vram > genome.vram_limit_mb * genome.vram_warning_threshold:
+            current_time = time.time()
+            if (current_time - self.last_vram_clear_time) > genome.min_time_between_vram_clears_sec:
+                logger.warning(f"Viršytas VRAM slenkstis ({reserved_vram:.2f}MB / {genome.vram_limit_mb}MB). Valoma GPU atmintis.")
+                torch.cuda.empty_cache()
+                self.last_vram_clear_time = current_time
+
+    async def evaluate_genome(self, genome: Genome) -> None:
+        device = torch.device(self.config.device)
+        dummy_data = torch.randn(genome.batch_size, self.initial_input_dim).to(device)
+        hnn_model = HNNBuilder.build_model_from_genome(genome, self.initial_input_dim, device)
+        if genome.qat_enabled:
+            modules_to_fuse = []
+            for i in range(len(hnn_model.encoder) - 1):
+                if isinstance(hnn_model.encoder[i], nn.Linear) and isinstance(hnn_model.encoder[i+1], (nn.ReLU, nn.GELU)):
+                    modules_to_fuse.append([f"encoder.{i}", f"encoder.{i+1}"])
+            torch.quantization.fuse_modules(hnn_model, modules_to_fuse, inplace=True)
+            hnn_model.qconfig = torch.quantization.get_default_qat_qconfig('fbgemm')
+            torch.quantization.prepare_qat(hnn_model, inplace=True)
+            if device.type == 'cuda':
+                logger.warning("QAT GPU palaikymas ribotas; naudojamas fbgemm. Rekomenduojama TensorRT ateityje.")
+        criterion = nn.MSELoss()
+        optimizer = optim.Adam(hnn_model.parameters(), lr=genome.learning_rate)
+        hnn_model.train()
+        for epoch in range(genome.training_epochs):
+            optimizer.zero_grad()
+            encoded, decoded = hnn_model(dummy_data)
+            loss = criterion(decoded, dummy_data)
+            loss.backward()
+            optimizer.step()
+            self._check_vram_limit(genome)
+        if genome.qat_enabled:
+            torch.quantization.convert(hnn_model, inplace=True)
+        hnn_model.eval()
+        with torch.no_grad():
+            encoded, decoded = hnn_model(dummy_data)
+            val_loss = criterion(decoded, dummy_data)
+            accuracy_score = 1.0 - (val_loss.item() / (dummy_data.max() - dummy_data.min()).item())
+            accuracy_score = max(0.0, accuracy_score)
+        genome.loss = val_loss.item()
+        genome.accuracy = accuracy_score
+        total_bits = sum(genome.layer_bits["encoder"]) + sum(genome.layer_bits["decoder"])
+        num_layers = len(genome.layer_bits["encoder"]) + len(genome.layer_bits["decoder"])
+        avg_bits = total_bits / (num_layers + 1e-5)
+        input_size_bits = SystemConfig.binance_data_points * 32
+        latent_size_bits = max(1, genome.hnn_architecture["latent_dim_flat"]) * avg_bits
+        genome.compression_ratio = input_size_bits / latent_size_bits if latent_size_bits > 0 else 0.0
+        vram_score = max(0, 1.0 - genome.vram_used_mb / genome.vram_limit_mb)
+        if avg_bits > genome.large_bit_penalty_threshold:
+            vram_score *= genome.large_bit_penalty_factor
+        ai_bonus = random.uniform(0.0, 0.1)
+        if genome.fitness_formula_type == "linear":
+            genome.fitness = (genome.accuracy * genome.fitness_weights["hnn_accuracy"] +
+                              vram_score * genome.fitness_weights["vram_efficiency"] +
+                              genome.compression_ratio * genome.fitness_weights["compression_ratio_impact"]+
+                              ai_bonus * genome.fitness_weights["ai_guidance_bonus"])
+        elif genome.fitness_formula_type == "exponential":
+            genome.fitness = math.exp(genome.accuracy) * genome.fitness_weights["hnn_accuracy"] + math.exp(vram_score) * genome.fitness_weights["vram_efficiency"] + math.exp(genome.compression_ratio / 10.0) * genome.fitness_weights["compression_ratio_impact"] + math.exp(ai_bonus) * genome.fitness_weights["ai_guidance_bonus"]
+        elif genome.fitness_formula_type == "multiplicative":
+            genome.fitness = genome.accuracy * vram_score * genome.compression_ratio * (1 + ai_bonus) * sum(genome.fitness_weights.values())
+        elif genome.fitness_formula_type == "quadratic":
+            genome.fitness = (genome.accuracy**2 * genome.fitness_weights["hnn_accuracy"] +
+                              vram_score**2 * genome.fitness_weights["vram_efficiency"] +
+                              genome.compression_ratio**2 * genome.fitness_weights["compression_ratio_impact"] +
+                              ai_bonus**2 * genome.fitness_weights["ai_guidance_bonus"])
+        logger.info(f"Genomas {genome.id[:8]} įvertintas: Fitnesas={genome.fitness:.4f}, Loss={genome.loss:.4f}, Accuracy={genome.accuracy:.4f}, VRAM={genome.vram_used_mb:.2f}MB, Comp.Ratio={genome.compression_ratio:.2f}, AvgBits={avg_bits:.2f}")
+
+    def select_parents(self, num_parents: int) -> List[Genome]:
+        total_fitness = sum(g.fitness for g in self.population)
+        if total_fitness == 0:
+            return random.sample(self.population, min(num_parents, len(self.population)))
+        selection_probs = [g.fitness / total_fitness for g in self.population]
+        return random.choices(self.population, weights=selection_probs, k=num_parents)
+
+    def crossover(self, parent1: Genome, parent2: Genome) -> Tuple[Genome, Genome]:
+        child1 = Genome(parent_ids=(parent1.id, parent2.id), generation=parent1.generation + 1)
+        child2 = Genome(parent_ids=(parent2.id, parent1.id), generation=parent1.generation + 1)
+        for section in ["encoder_layers", "decoder_layers"]:
+            min_len = min(len(parent1.hnn_architecture[section]), len(parent2.hnn_architecture[section]))
+            crossover_point = random.randint(0, min_len)
+            child1.hnn_architecture[section] = parent1.hnn_architecture[section][:crossover_point] + parent2.hnn_architecture[section][crossover_point:]
+            child2.hnn_architecture[section] = parent2.hnn_architecture[section][:crossover_point] + parent1.hnn_architecture[section][crossover_point:]
+            child1.layer_bits[section] = parent1.layer_bits[section][:crossover_point] + parent2.layer_bits[section][crossover_point:]
+            child2.layer_bits[section] = parent2.layer_bits[section][:crossover_point] + parent1.layer_bits[section][crossover_point:]
+            target_len1 = len(child1.hnn_architecture[section])
+            if len(child1.layer_bits[section]) < target_len1:
+                child1.layer_bits[section].extend([random.randint(1, 512) for _ in range(target_len1 - len(child1.layer_bits[section]))])
+            elif len(child1.layer_bits[section]) > target_len1:
+                child1.layer_bits[section] = child1.layer_bits[section][:target_len1]
+            target_len2 = len(child2.hnn_architecture[section])
+            if len(child2.layer_bits[section]) < target_len2:
+                child2.layer_bits[section].extend([random.randint(1, 512) for _ in range(target_len2 - len(child2.layer_bits[section]))])
+            elif len(child2.layer_bits[section]) > target_len2:
+                child2.layer_bits[section] = child2.layer_bits[section][:target_len2]
+        for param in ["training_epochs", "learning_rate", "batch_size", "qat_enabled", "vram_limit_mb", "min_time_between_vram_clears_sec", "vram_warning_threshold", "large_bit_penalty_threshold", "large_bit_penalty_factor", "fitness_formula_type"]:
+            setattr(child1, param, getattr(random.choice([parent1, parent2]), param))
+            setattr(child2, param, getattr(random.choice([parent1, parent2]), param))
+        for key in parent1.fitness_weights:
+            child1.fitness_weights[key] = random.choice([parent1.fitness_weights[key], parent2.fitness_weights[key]])
+            child2.fitness_weights[key] = random.choice([parent1.fitness_weights[key], parent2.fitness_weights[key]])
+        return child1, child2
+
+    def mutate(self, genome: Genome) -> None:
+        if random.random() < 0.2:
+            section = random.choice(["encoder_layers", "decoder_layers"])
+            if random.random() < 0.5 and genome.hnn_architecture[section]:
+                idx = random.randint(0, len(genome.hnn_architecture[section]) - 1)
+                genome.hnn_architecture[section][idx].type = random.choice(["linear", "conv", "dropout", "batch_norm", "max_pool", "avg_pool"])
+                genome.hnn_architecture[section][idx].activation = random.choice(["GELU", "ReLU", "Sigmoid", "None", "LeakyReLU", "Tanh"])
+                genome.hnn_architecture[section][idx].out_features = random.randint(32, 256)
+                if genome.hnn_architecture[section][idx].type == "dropout":
+                    genome.hnn_architecture[section][idx].dropout_rate = random.uniform(0.1, 0.5)
+                if genome.hnn_architecture[section][idx].type in ["conv", "max_pool", "avg_pool"]:
+                    genome.hnn_architecture[section][idx].kernel_size = random.choice([3, 5])
+                    genome.hnn_architecture[section][idx].stride = random.choice([1, 2])
+            elif random.random() < 0.2:
+                genome.hnn_architecture[section].append(HNNLayer())
+                genome.layer_bits[section].append(random.randint(1, 512))
+            elif len(genome.hnn_architecture[section]) > 1 and random.random() < 0.1:
+                idx = random.randint(0, len(genome.hnn_architecture[section]) - 1)
+                genome.hnn_architecture[section].pop(idx)
+                genome.layer_bits[section].pop(idx)
+        if random.random() < 0.1:
+            genome.hnn_architecture["latent_dim_flat"] = max(16, min(512, genome.hnn_architecture["latent_dim_flat"] + random.randint(-16, 16)))
+        if random.random() < 0.3:
+            section = random.choice(["encoder", "decoder"])
+            if genome.layer_bits[section]:
+                idx = random.randint(0, len(genome.layer_bits[section]) - 1)
+                delta = random.choice([-8, -4, -2, -1, 1, 2, 4, 8, 16])
+                genome.layer_bits[section][idx] = max(1, min(512, genome.layer_bits[section][idx] + delta))
+        if random.random() < 0.1:
+            genome.training_epochs = max(5, min(100, genome.training_epochs + random.randint(-10, 10)))
+        if random.random() < 0.1:
+            genome.learning_rate = max(1e-5, min(1e-1, genome.learning_rate * random.uniform(0.8, 1.2)))
+        if random.random() < 0.1:
+            genome.batch_size = random.choice([32, 64, 128, 256])
+        if random.random() < 0.15:
+            weight_key = random.choice(list(genome.fitness_weights.keys()))
+            genome.fitness_weights[weight_key] = max(0.0, min(1.0, genome.fitness_weights[weight_key] + random.uniform(-0.1, 0.1)))
+        if random.random() < 0.05:
+            genome.fitness_formula_type = random.choice(["linear", "exponential", "multiplicative", "quadratic"])
+        if random.random() < 0.05:
+            genome.vram_limit_mb = max(1000, min(16000, genome.vram_limit_mb + random.randint(-1000, 1000)))
+        if random.random() < 0.05:
+            genome.min_time_between_vram_clears_sec = max(1, min(20, genome.min_time_between_vram_clears_sec + random.randint(-2, 2)))
+        if random.random() < 0.05:
+            genome.vram_warning_threshold = max(0.5, min(0.99, genome.vram_warning_threshold + random.uniform(-0.05, 0.05)))
+        if random.random() < 0.05:
+            genome.large_bit_penalty_threshold = max(32, min(512, genome.large_bit_penalty_threshold + random.randint(-32, 32)))
+        if random.random() < 0.05:
+            genome.large_bit_penalty_factor = max(0.1, min(1.0, genome.large_bit_penalty_factor + random.uniform(-0.1, 0.1)))
+        if random.random() < 0.05:
+            genome.qat_enabled = not genome.qat_enabled
+
+    async def evolve(self, population_size: int, num_generations: int, num_parents: int):
+        await self.initialize_population(population_size)
+        for generation in range(num_generations):
+            logger.info(f"--- Pradedama generacija {generation + 1}/{num_generations} ---")
+            await asyncio.gather(*[self.evaluate_genome(genome) for genome in self.population])
+            self.population.sort(key=lambda g: g.fitness, reverse=True)
+            elite_count = max(1, population_size // 10)
+            next_generation = self.population[:elite_count]
+            parents = self.select_parents(num_parents)
+            while len(next_generation) < population_size:
+                if len(parents) < 2:
+                    next_generation.append(Genome(generation=generation + 1))
+                    continue
+                p1, p2 = random.sample(parents, 2)
+                child1, child2 = self.crossover(p1, p2)
+                self.mutate(child1)
+                self.mutate(child2)
+                next_generation.append(child1)
+                if len(next_generation) < population_size:
+                    next_generation.append(child2)
+            self.population = next_generation
+        logger.info("Evoliucija baigta.")
+        self.population.sort(key=lambda g: g.fitness, reverse=True)
+        best_genome = self.population[0]
+        logger.info(f"Geriausias genomas: ID={best_genome.id[:8]}, Fitnesas={best_genome.fitness:.4f}")
+        # Kita logika kaip ankstesniuose
+
+# --- Pagrindinis Vykdymas ---
+async def main():
+    system_config = SystemConfig()
+    ga = GeneticArchitect(system_config, system_config.binance_data_points)
+    await ga.evolve(5, 10, 2)
+
+if __name__ == "__main__":
+    asyncio.run(main())
