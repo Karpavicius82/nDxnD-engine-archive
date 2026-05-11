@@ -1,0 +1,24 @@
+Implemented the real nD lattice in [living_silicon.hpp](/abs/path/D:/TEMP_NDXND_REPO/reference/living_silicon/living_silicon.hpp) and [living_silicon.cpp](/abs/path/D:/TEMP_NDXND_REPO/reference/living_silicon/living_silicon.cpp).
+
+What changed:
+- Added `alignas(64) NdShape` with `rank`, `dims[4]`, `stride[4]`, and `wrap_mask`.
+- Added runtime topology state to `ThreadState`: `shape`, `scratch`, and `scratch_phase`.
+- Added topology genome fields: `d_rank`, `kernel_radius`, `boundary_mode`, `d_dim0..d_dim3`, plus snapshot/clone/crossover propagation.
+- Preserved the existing AVX2 path when `shape.rank <= 1`.
+- Added a true rank 2-4 stencil path:
+  - Uses shape-derived strides.
+  - Aggregates neighbors across every active dimension.
+  - Supports `kernel_radius` 1-4.
+  - Uses toroidal wrapping via `wrap_mask`, with clamp mode available through `boundary_mode`.
+  - Uses fixed preallocated scratch buffers, no heap allocation in the hot path.
+- Updated coherence and threshold sampling to use the active topology node count.
+- Extended `maybe_mutate()` so GA can mutate:
+  - scalar fields,
+  - `kernel_radius`,
+  - rank/dim topology,
+  - wrap/clamp boundary mode.
+- Topology mutation generates valid power-of-two lattice shapes with product exactly `kNodes` for ranks 1-4, e.g. 1D/2D/3D/4D layouts.
+
+Verification:
+- Ran MSVC C++20 syntax compile successfully.
+- Ran MSVC C++20 `/arch:AVX2` compile successfully, so the SIMD path also compiles.

@@ -1,0 +1,10 @@
+Wrote the audit to [docs/ndxnd_codex_audit.md](D:/TEMP_NDXND_REPO/docs/ndxnd_codex_audit.md).
+
+Key conclusions included:
+- Treated the 28 requested files as `versions/012` through `versions/039`.
+- Confirmed `v028` has duplicate `HNNBuilder` definitions at lines `172` and `1065`; the second is contaminated/broken and should not be used.
+- Marked `v033` 485:1 compression as simulated, not validated benchmark evidence.
+- Re-ranked Top 5 with evidence weighting: `v024`, `v036`, `v018`, `v039`, `v033`.
+- Assessed C++ portability against `reference/living_silicon`, favoring GA control ideas over PyTorch/Numba/sklearn model machinery.
+
+No tests were run; this was a source/document audit only.
