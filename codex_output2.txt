@@ -1,0 +1,13 @@
+Wrote the deep analysis to [docs/ndxnd_gnn_ga_tensor_analysis.md](D:/TEMP_NDXND_REPO/docs/ndxnd_gnn_ga_tensor_analysis.md).
+
+It includes:
+
+- Per-version GNN+GA mapping for `012-039`
+- Scoring matrix and ranking
+- Extracted Python snippets with line numbers
+- C++ int16/AVX2 pseudo-code and cycle estimates
+- `tensor_nd.hpp` operation-by-operation analysis
+- Hybrid engine design
+- Living Silicon comparison and minimal nD migration path
+
+No tests were run because this was documentation/source analysis only.
