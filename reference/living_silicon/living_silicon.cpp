@@ -37,6 +37,164 @@ std::uint16_t phase_distance(const std::uint16_t a, const std::uint16_t b) {
   return static_cast<std::uint16_t>(std::min<std::uint32_t>(d, 65536U - d));
 }
 
+std::size_t nd_node_count(const NdShape &shape) {
+  std::size_t total = 1;
+  const auto rank = std::clamp<int>(shape.rank, 1, 4);
+  for (int axis = 0; axis < rank; ++axis) {
+    total *= std::max<std::uint16_t>(shape.dims[axis], 1);
+  }
+  return std::min<std::size_t>(total, kNodes);
+}
+
+NdShape make_shape(std::uint8_t rank, const std::uint16_t dims_in[4],
+                   const bool wrap) {
+  NdShape shape{};
+  shape.rank = static_cast<std::uint8_t>(std::clamp<int>(rank, 1, 4));
+  std::size_t total = 1;
+  for (int axis = 0; axis < 4; ++axis) {
+    std::uint16_t dim =
+        axis < shape.rank ? std::max<std::uint16_t>(dims_in[axis], 1) : 1;
+    if (axis < shape.rank && total * dim > kNodes) {
+      dim = static_cast<std::uint16_t>(
+          std::max<std::size_t>(1, kNodes / total));
+    }
+    shape.dims[axis] = dim;
+    if (axis < shape.rank) {
+      total *= dim;
+    }
+  }
+  shape.stride[0] = 1;
+  for (int axis = 1; axis < 4; ++axis) {
+    shape.stride[axis] = static_cast<std::uint16_t>(
+        shape.stride[axis - 1] * shape.dims[axis - 1]);
+  }
+  shape.wrap_mask =
+      wrap ? static_cast<std::uint8_t>((1U << shape.rank) - 1U) : 0U;
+  return shape;
+}
+
+NdShape random_power2_shape(std::uint32_t &rng, const std::uint8_t rank,
+                            const bool wrap) {
+  std::uint16_t dims[4]{1, 1, 1, 1};
+  int remaining_pow2 = 11; // kNodes == 2^11
+  const int active_rank = std::clamp<int>(rank, 1, 4);
+  for (int axis = 0; axis < active_rank; ++axis) {
+    dims[axis] = 2;
+    --remaining_pow2;
+  }
+  while (remaining_pow2 > 0) {
+    const auto axis = static_cast<int>(
+        xorshift32(rng) % static_cast<std::uint32_t>(active_rank));
+    dims[axis] = static_cast<std::uint16_t>(dims[axis] << 1);
+    --remaining_pow2;
+  }
+  return make_shape(static_cast<std::uint8_t>(active_rank), dims, wrap);
+}
+
+void store_shape_to_genome(Genome &genome, const NdShape &shape) {
+  genome.d_rank.store(shape.rank, std::memory_order_relaxed);
+  genome.d_dim0.store(static_cast<std::int16_t>(shape.dims[0]),
+                      std::memory_order_relaxed);
+  genome.d_dim1.store(static_cast<std::int16_t>(shape.dims[1]),
+                      std::memory_order_relaxed);
+  genome.d_dim2.store(static_cast<std::int16_t>(shape.dims[2]),
+                      std::memory_order_relaxed);
+  genome.d_dim3.store(static_cast<std::int16_t>(shape.dims[3]),
+                      std::memory_order_relaxed);
+  genome.boundary_mode.store(shape.wrap_mask != 0 ? 1 : 0,
+                             std::memory_order_relaxed);
+}
+
+std::int64_t advance_lane_nd_scalar(ThreadState &state, const NdShape &shape,
+                                    const std::size_t active_nodes,
+                                    const std::int16_t delta,
+                                    const std::int16_t coupling,
+                                    const std::int16_t blend,
+                                    const std::int16_t decay,
+                                    const std::int16_t radius) {
+  std::copy_n(state.mag.begin(), active_nodes, state.scratch.begin());
+  std::copy_n(state.ph.begin(), active_nodes, state.scratch_phase.begin());
+
+  const int rank = std::clamp<int>(shape.rank, 1, 4);
+  const int stencil_radius = std::clamp<int>(radius, 1, 4);
+  std::int64_t tick_energy = 0;
+
+  for (std::size_t j = 0; j < active_nodes; ++j) {
+    std::uint16_t coord[4]{0, 0, 0, 0};
+    std::size_t rem = j;
+    for (int axis = rank - 1; axis >= 0; --axis) {
+      const auto stride = static_cast<std::size_t>(shape.stride[axis]);
+      coord[axis] = static_cast<std::uint16_t>(rem / stride);
+      rem %= stride;
+    }
+
+    std::int32_t mag_sum = 0;
+    std::uint32_t phase_sum = 0;
+    std::int32_t count = 0;
+
+    for (int axis = 0; axis < rank; ++axis) {
+      const int dim = std::max<int>(shape.dims[axis], 1);
+      const int base_coord = coord[axis];
+      const auto stride = static_cast<std::size_t>(shape.stride[axis]);
+      const bool wrap = (shape.wrap_mask & (1U << axis)) != 0;
+
+      for (int r = 1; r <= stencil_radius; ++r) {
+        for (int dir_index = 0; dir_index < 2; ++dir_index) {
+          const int dir = dir_index == 0 ? -1 : 1;
+          int next_coord = base_coord + dir * r;
+          if (wrap) {
+            next_coord %= dim;
+            if (next_coord < 0) {
+              next_coord += dim;
+            }
+          } else {
+            next_coord = std::clamp(next_coord, 0, dim - 1);
+          }
+
+          const auto offset =
+              static_cast<std::ptrdiff_t>(next_coord - base_coord) *
+              static_cast<std::ptrdiff_t>(stride);
+          const auto neighbor =
+              static_cast<std::size_t>(static_cast<std::ptrdiff_t>(j) + offset);
+          const auto bounded_neighbor =
+              std::min<std::size_t>(neighbor, active_nodes - 1);
+          mag_sum += state.scratch[bounded_neighbor];
+          phase_sum += static_cast<std::uint16_t>(
+              state.scratch_phase[bounded_neighbor] + delta +
+              state.omega[bounded_neighbor]);
+          ++count;
+        }
+      }
+    }
+
+    const auto p = static_cast<std::uint16_t>(state.scratch_phase[j] + delta +
+                                             state.omega[j]);
+    const auto pn =
+        static_cast<std::uint16_t>(phase_sum / static_cast<std::uint32_t>(count));
+    const auto m = state.scratch[j];
+    const auto mn = static_cast<std::int16_t>(mag_sum / count);
+
+    const auto pb = static_cast<std::uint16_t>(
+        (static_cast<std::uint32_t>(p) * blend +
+         static_cast<std::uint32_t>(pn) * (256 - blend)) >>
+        8);
+    auto mb = static_cast<int>(
+        (static_cast<int>(m) * blend + static_cast<int>(mn) * (256 - blend)) >>
+        8);
+    const int sign = (static_cast<std::uint16_t>(pb + 16384U) >> 15) ? -1 : 1;
+    mb = clamp_i16(mb + sign * static_cast<int>(state.ei[j]) * coupling);
+    if (decay > 0) {
+      mb -= (mb >> decay);
+    }
+
+    state.mag[j] = static_cast<std::int16_t>(clamp_i16(mb));
+    state.ph[j] = pb;
+    tick_energy += std::abs(static_cast<int>(state.mag[j]));
+  }
+
+  return tick_energy;
+}
+
 #if defined(__AVX2__)
 // Pure SIMD horizontal absolute sum — matches V3 original (zero store-to-load
 // penalty)
@@ -72,6 +230,13 @@ void Engine::initialize(const std::uint64_t seed) {
     genome.inject_rate.store(64, std::memory_order_relaxed);
     genome.omega_width.store(8, std::memory_order_relaxed);
     genome.ei_balance.store(204, std::memory_order_relaxed);
+    genome.d_rank.store(1, std::memory_order_relaxed);
+    genome.kernel_radius.store(1, std::memory_order_relaxed);
+    genome.boundary_mode.store(1, std::memory_order_relaxed);
+    genome.d_dim0.store(2048, std::memory_order_relaxed);
+    genome.d_dim1.store(1, std::memory_order_relaxed);
+    genome.d_dim2.store(1, std::memory_order_relaxed);
+    genome.d_dim3.store(1, std::memory_order_relaxed);
     genome.generation.store(0, std::memory_order_relaxed);
     genome.fitness.store(0, std::memory_order_relaxed);
     genome.best_fitness.store(0, std::memory_order_relaxed);
@@ -81,6 +246,8 @@ void Engine::initialize(const std::uint64_t seed) {
     auto &obs = obs_[lane];
     state.rng = 0xCAFE0000U + static_cast<std::uint32_t>(lane) ^ rng;
     state.tick_counter = 0;
+    std::uint16_t default_dims[4]{2048, 1, 1, 1};
+    state.shape = make_shape(1, default_dims, true);
     for (auto &word : state.nd) {
       word =
           (static_cast<std::uint64_t>(xorshift32(rng)) << 32) | xorshift32(rng);
@@ -191,6 +358,11 @@ void Engine::advance_lane(const std::size_t lane) {
 
   std::int64_t tick_energy = 0;
 
+  const auto kernel_radius = genome.kernel_radius.load(std::memory_order_relaxed);
+  const auto shape = state.shape;
+  const auto active_nodes = nd_node_count(shape);
+
+  if (shape.rank <= 1 || active_nodes <= 1) {
 // AVX2 path — Kuramoto omega + E/I coupling + correct Q8 blend
 #if defined(__AVX2__)
   const __m256i delta_v = _mm256_set1_epi16(delta);
@@ -336,15 +508,55 @@ void Engine::advance_lane(const std::size_t lane) {
   }
 #endif
 
+  } else {
+    tick_energy = advance_lane_nd_scalar(state, shape, active_nodes, delta,
+                                         coupling, blend, decay, kernel_radius);
+  }
+
   obs.energy = tick_energy;
 
   // Coherence: only at epoch boundaries (every 128 ticks) — matches V3 original
   if (is_epoch) {
     std::int64_t tick_coherence = 0;
-    for (std::size_t j = 0; j < kNodes; ++j) {
-      const std::size_t next = (j + 1U) & (kNodes - 1U);
-      tick_coherence += phase_distance(state.ph[j], state.ph[next]);
+    std::int64_t coherence_edges = 0;
+    const int rank = std::clamp<int>(shape.rank, 1, 4);
+    for (std::size_t j = 0; j < active_nodes; ++j) {
+      if (shape.rank <= 1) {
+        const std::size_t next = (j + 1U) & (kNodes - 1U);
+        tick_coherence += phase_distance(state.ph[j], state.ph[next]);
+        ++coherence_edges;
+        continue;
+      }
+
+      std::uint16_t coord[4]{0, 0, 0, 0};
+      std::size_t rem = j;
+      for (int axis = rank - 1; axis >= 0; --axis) {
+        const auto stride = static_cast<std::size_t>(shape.stride[axis]);
+        coord[axis] = static_cast<std::uint16_t>(rem / stride);
+        rem %= stride;
+      }
+      for (int axis = 0; axis < rank; ++axis) {
+        const int dim = std::max<int>(shape.dims[axis], 1);
+        const int base_coord = coord[axis];
+        int next_coord = base_coord + 1;
+        if ((shape.wrap_mask & (1U << axis)) != 0) {
+          next_coord %= dim;
+        } else if (next_coord >= dim) {
+          continue;
+        }
+        const auto offset =
+            static_cast<std::ptrdiff_t>(next_coord - base_coord) *
+            static_cast<std::ptrdiff_t>(shape.stride[axis]);
+        const auto neighbor =
+            static_cast<std::size_t>(static_cast<std::ptrdiff_t>(j) + offset);
+        tick_coherence += phase_distance(state.ph[j], state.ph[neighbor]);
+        ++coherence_edges;
+      }
     }
+    tick_coherence =
+        coherence_edges > 0 ? (tick_coherence * static_cast<std::int64_t>(kNodes)) /
+                                  coherence_edges
+                            : 0;
     const auto normalized =
         std::clamp<std::int64_t>(65535 - (tick_coherence >> 5), 0, 65535);
     obs.coherence = normalized;
@@ -371,13 +583,15 @@ void Engine::advance_lane(const std::size_t lane) {
   // nd[] and nd_popcount BEFORE fitness/mutation
   // P2: Adaptive threshold — scales to actual magnitude level instead of
   //     fixed 8000 which is 150x above average magnitude (~52).
-  const auto avg_abs = static_cast<std::int32_t>(tick_energy / kNodes);
+  const auto avg_abs = static_cast<std::int32_t>(
+      tick_energy / std::max<std::size_t>(1, active_nodes));
   const auto effective_threshold =
       static_cast<std::int16_t>(std::max<std::int32_t>(64, avg_abs * 4));
   std::uint64_t exc = 0;
   std::uint64_t inh = 0;
   for (int bit = 0; bit < 64; ++bit) {
-    const auto idx = static_cast<std::size_t>((bit * 32) & (kNodes - 1));
+    const auto idx = static_cast<std::size_t>(
+        (bit * 32) % std::max<std::size_t>(1, active_nodes));
     if (state.mag[idx] > effective_threshold)
       exc |= (1ULL << bit);
     if (state.mag[idx] < -effective_threshold)
@@ -515,7 +729,7 @@ void Engine::maybe_mutate(const std::size_t lane,
     };
 
     xorshift32(state.rng);
-    switch (state.rng % 8U) {
+    switch (state.rng % 11U) {
     case 0:
       mutate_field(genome.delta, 1, 100, 0x0F, 8);
       break;
@@ -537,6 +751,25 @@ void Engine::maybe_mutate(const std::size_t lane,
     case 6:
       mutate_field(genome.ei_balance, 128, 240, 0x0F, 8);
       break; // E/I ratio
+    case 7:
+      mutate_field(genome.kernel_radius, 1, 4, 0x03, 1);
+      break;
+    case 8: {
+      const bool wrap =
+          genome.boundary_mode.load(std::memory_order_relaxed) != 0;
+      const auto rank =
+          static_cast<std::uint8_t>(1U + (xorshift32(state.rng) & 0x03U));
+      state.shape = random_power2_shape(state.rng, rank, wrap);
+      store_shape_to_genome(genome, state.shape);
+      break;
+    }
+    case 9: {
+      const bool wrap =
+          genome.boundary_mode.load(std::memory_order_relaxed) == 0;
+      state.shape = make_shape(state.shape.rank, state.shape.dims, wrap);
+      store_shape_to_genome(genome, state.shape);
+      break;
+    }
     default:
       mutate_field(genome.coupling, 0, 200, 0x0F, 8);
       break;
@@ -636,6 +869,12 @@ void Engine::maybe_crossover() {
     gw.delta.store(gb.delta.load(std::memory_order_relaxed),
                    std::memory_order_relaxed);
   }
+  if ((data_[worst].rng & 2U) == 0U) {
+    data_[worst].shape = data_[best].shape;
+    store_shape_to_genome(gw, data_[worst].shape);
+    gw.kernel_radius.store(gb.kernel_radius.load(std::memory_order_relaxed),
+                           std::memory_order_relaxed);
+  }
   // Reset worst stagnation so it gets a fair chance
   obs_[worst].stagnation_epochs = 0;
 }
@@ -663,6 +902,13 @@ GenomeSnapshot Engine::genome(const std::size_t lane) const {
       .inject_rate = genome.inject_rate.load(std::memory_order_relaxed),
       .omega_width = genome.omega_width.load(std::memory_order_relaxed),
       .ei_balance = genome.ei_balance.load(std::memory_order_relaxed),
+      .d_rank = genome.d_rank.load(std::memory_order_relaxed),
+      .kernel_radius = genome.kernel_radius.load(std::memory_order_relaxed),
+      .boundary_mode = genome.boundary_mode.load(std::memory_order_relaxed),
+      .d_dim0 = genome.d_dim0.load(std::memory_order_relaxed),
+      .d_dim1 = genome.d_dim1.load(std::memory_order_relaxed),
+      .d_dim2 = genome.d_dim2.load(std::memory_order_relaxed),
+      .d_dim3 = genome.d_dim3.load(std::memory_order_relaxed),
       .generation = genome.generation.load(std::memory_order_relaxed),
       .fitness = genome.fitness.load(std::memory_order_relaxed),
       .best_fitness = genome.best_fitness.load(std::memory_order_relaxed),
@@ -697,6 +943,13 @@ LaneSnapshot Engine::snapshot(const std::size_t lane) const {
               .inject_rate = g.inject_rate.load(std::memory_order_relaxed),
               .omega_width = g.omega_width.load(std::memory_order_relaxed),
               .ei_balance = g.ei_balance.load(std::memory_order_relaxed),
+              .d_rank = g.d_rank.load(std::memory_order_relaxed),
+              .kernel_radius = g.kernel_radius.load(std::memory_order_relaxed),
+              .boundary_mode = g.boundary_mode.load(std::memory_order_relaxed),
+              .d_dim0 = g.d_dim0.load(std::memory_order_relaxed),
+              .d_dim1 = g.d_dim1.load(std::memory_order_relaxed),
+              .d_dim2 = g.d_dim2.load(std::memory_order_relaxed),
+              .d_dim3 = g.d_dim3.load(std::memory_order_relaxed),
               .generation = g.generation.load(std::memory_order_relaxed),
               .fitness = g.fitness.load(std::memory_order_relaxed),
               .best_fitness = g.best_fitness.load(std::memory_order_relaxed),
@@ -783,6 +1036,20 @@ void Engine::clone_lane(std::size_t from, std::size_t to) {
                         std::memory_order_relaxed);
   dst.ei_balance.store(src.ei_balance.load(std::memory_order_relaxed),
                        std::memory_order_relaxed);
+  dst.d_rank.store(src.d_rank.load(std::memory_order_relaxed),
+                   std::memory_order_relaxed);
+  dst.kernel_radius.store(src.kernel_radius.load(std::memory_order_relaxed),
+                          std::memory_order_relaxed);
+  dst.boundary_mode.store(src.boundary_mode.load(std::memory_order_relaxed),
+                          std::memory_order_relaxed);
+  dst.d_dim0.store(src.d_dim0.load(std::memory_order_relaxed),
+                   std::memory_order_relaxed);
+  dst.d_dim1.store(src.d_dim1.load(std::memory_order_relaxed),
+                   std::memory_order_relaxed);
+  dst.d_dim2.store(src.d_dim2.load(std::memory_order_relaxed),
+                   std::memory_order_relaxed);
+  dst.d_dim3.store(src.d_dim3.load(std::memory_order_relaxed),
+                   std::memory_order_relaxed);
   dst.generation.store(src.generation.load(std::memory_order_relaxed),
                        std::memory_order_relaxed);
   dst.fitness.store(src.fitness.load(std::memory_order_relaxed),
@@ -825,6 +1092,20 @@ void Engine::clone_lane_to(Engine &target, const std::size_t from,
                         std::memory_order_relaxed);
   dst.ei_balance.store(src.ei_balance.load(std::memory_order_relaxed),
                        std::memory_order_relaxed);
+  dst.d_rank.store(src.d_rank.load(std::memory_order_relaxed),
+                   std::memory_order_relaxed);
+  dst.kernel_radius.store(src.kernel_radius.load(std::memory_order_relaxed),
+                          std::memory_order_relaxed);
+  dst.boundary_mode.store(src.boundary_mode.load(std::memory_order_relaxed),
+                          std::memory_order_relaxed);
+  dst.d_dim0.store(src.d_dim0.load(std::memory_order_relaxed),
+                   std::memory_order_relaxed);
+  dst.d_dim1.store(src.d_dim1.load(std::memory_order_relaxed),
+                   std::memory_order_relaxed);
+  dst.d_dim2.store(src.d_dim2.load(std::memory_order_relaxed),
+                   std::memory_order_relaxed);
+  dst.d_dim3.store(src.d_dim3.load(std::memory_order_relaxed),
+                   std::memory_order_relaxed);
   dst.generation.store(src.generation.load(std::memory_order_relaxed),
                        std::memory_order_relaxed);
   dst.fitness.store(src.fitness.load(std::memory_order_relaxed),

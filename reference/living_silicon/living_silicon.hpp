@@ -22,6 +22,13 @@ struct alignas(64) Genome {
     std::atomic<std::int16_t> inject_rate{64};
     std::atomic<std::int16_t> omega_width{8};     // Kuramoto: natural frequency spread [1..32]
     std::atomic<std::int16_t> ei_balance{204};     // E/I ratio threshold [128..240] (~80% excitatory)
+    std::atomic<std::int16_t> d_rank{1};           // active lattice rank [1..4]
+    std::atomic<std::int16_t> kernel_radius{1};    // nD stencil radius [1..4]
+    std::atomic<std::int16_t> boundary_mode{1};    // 1=wrap/toroidal, 0=clamp
+    std::atomic<std::int16_t> d_dim0{2048};
+    std::atomic<std::int16_t> d_dim1{1};
+    std::atomic<std::int16_t> d_dim2{1};
+    std::atomic<std::int16_t> d_dim3{1};
     std::atomic<std::uint32_t> generation{0};
     std::atomic<std::int32_t> fitness{0};
     std::atomic<std::int32_t> best_fitness{0};
@@ -37,6 +44,13 @@ struct GenomeSnapshot {
     std::int16_t inject_rate{64};
     std::int16_t omega_width{8};
     std::int16_t ei_balance{204};
+    std::int16_t d_rank{1};
+    std::int16_t kernel_radius{1};
+    std::int16_t boundary_mode{1};
+    std::int16_t d_dim0{2048};
+    std::int16_t d_dim1{1};
+    std::int16_t d_dim2{1};
+    std::int16_t d_dim3{1};
     std::uint32_t generation{0};
     std::int32_t fitness{0};
     std::int32_t best_fitness{0};
@@ -80,11 +94,21 @@ struct alignas(64) ControllerState {
     std::uint32_t attention_hits{0};
 };
 
+struct alignas(64) NdShape {
+    std::uint8_t rank{1};
+    std::uint16_t dims[4]{2048, 1, 1, 1};
+    std::uint16_t stride[4]{1, 2048, 2048, 2048};
+    std::uint8_t wrap_mask{0x0F};
+};
+
 struct alignas(64) ThreadState {
     std::array<std::int16_t, kNodes> mag{};
     std::array<std::uint16_t, kNodes> ph{};
     std::array<std::int16_t, kNodes> omega{};  // per-node natural frequency detuning (Kuramoto)
     std::array<std::int8_t, kNodes> ei{};      // per-node E/I identity: +1 excitatory, -1 inhibitory
+    NdShape shape{};
+    alignas(64) std::array<std::int16_t, kNodes> scratch{};
+    alignas(64) std::array<std::uint16_t, kNodes> scratch_phase{};
     std::array<std::uint64_t, 4> nd{};
     std::uint32_t rng{0};
     std::uint64_t tick_counter{0};
