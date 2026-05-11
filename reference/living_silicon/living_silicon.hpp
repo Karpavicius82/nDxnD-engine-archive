@@ -12,9 +12,9 @@ inline constexpr std::size_t kNodes = 2048;
 inline constexpr std::size_t kThreads = 8;
 inline constexpr std::uint64_t kEpochMask = 0x7f;
 inline constexpr std::size_t kCrossoverEpochs = 4;  // crossover every N epochs
-inline constexpr std::size_t kMaxOffsets = 32;      // rank 4 * radius 4 * 2
-inline constexpr std::size_t kVectorLanes = 16;
-inline constexpr std::size_t kVectorBlocks = kNodes / kVectorLanes;
+inline constexpr std::size_t kBlocks = 128;      // kNodes / 16
+inline constexpr std::size_t kBlockLanes = 16;   // AVX2 int16 width
+inline constexpr std::size_t kMaxNeighbors = 4;  // per-block neighbor slots
 
 struct alignas(64) Genome {
     std::atomic<std::int16_t> delta{17};
@@ -25,13 +25,6 @@ struct alignas(64) Genome {
     std::atomic<std::int16_t> inject_rate{64};
     std::atomic<std::int16_t> omega_width{8};     // Kuramoto: natural frequency spread [1..32]
     std::atomic<std::int16_t> ei_balance{204};     // E/I ratio threshold [128..240] (~80% excitatory)
-    std::atomic<std::int16_t> d_rank{1};           // active lattice rank [1..4]
-    std::atomic<std::int16_t> kernel_radius{1};    // nD stencil radius [1..4]
-    std::atomic<std::int16_t> boundary_mode{1};    // 1=wrap/toroidal, 0=clamp
-    std::atomic<std::int16_t> d_dim0{2048};
-    std::atomic<std::int16_t> d_dim1{1};
-    std::atomic<std::int16_t> d_dim2{1};
-    std::atomic<std::int16_t> d_dim3{1};
     std::atomic<std::uint32_t> generation{0};
     std::atomic<std::int32_t> fitness{0};
     std::atomic<std::int32_t> best_fitness{0};
@@ -47,13 +40,6 @@ struct GenomeSnapshot {
     std::int16_t inject_rate{64};
     std::int16_t omega_width{8};
     std::int16_t ei_balance{204};
-    std::int16_t d_rank{1};
-    std::int16_t kernel_radius{1};
-    std::int16_t boundary_mode{1};
-    std::int16_t d_dim0{2048};
-    std::int16_t d_dim1{1};
-    std::int16_t d_dim2{1};
-    std::int16_t d_dim3{1};
     std::uint32_t generation{0};
     std::int32_t fitness{0};
     std::int32_t best_fitness{0};
@@ -97,36 +83,43 @@ struct alignas(64) ControllerState {
     std::uint32_t attention_hits{0};
 };
 
-struct alignas(64) NdShape {
-    std::uint8_t rank{1};
-    std::uint16_t dims[4]{2048, 1, 1, 1};
-    std::uint16_t stride[4]{1, 2048, 2048, 2048};
-    std::uint8_t wrap_mask{0x0F};
-};
+struct alignas(64) Lane2048 {
+    // === Living field state ===
+    alignas(64) std::array<std::int16_t, kNodes> mag{};
+    alignas(64) std::array<std::uint16_t, kNodes> ph{};
+    alignas(64) std::array<std::int16_t, kNodes> omega{};
+    alignas(64) std::array<std::int8_t, kNodes> ei{};
 
-struct alignas(64) NdVectorKernel {
-    std::uint8_t rank{1};
-    std::uint8_t radius{1};
-    std::uint16_t active_nodes{2048};
-    std::uint16_t offset_count{0};
-    std::array<std::int16_t, kMaxOffsets> offsets{};
-    std::array<std::int16_t, kMaxOffsets> weights_q15{};
-    std::array<std::uint8_t, kVectorBlocks> vector_block_safe{};
-    std::uint16_t vector_begin{0};
-    std::uint16_t vector_end{0};
-};
+    // === Topology as living tissue (per-block, not metadata) ===
+    alignas(64) std::array<std::int16_t, kBlocks> off0{};
+    alignas(64) std::array<std::int16_t, kBlocks> off1{};
+    alignas(64) std::array<std::int16_t, kBlocks> off2{};
+    alignas(64) std::array<std::int16_t, kBlocks> off3{};
 
-NdVectorKernel build_nd_vector_plan(const NdShape& shape, std::int16_t radius);
+    alignas(64) std::array<std::int16_t, kBlocks> w0{};
+    alignas(64) std::array<std::int16_t, kBlocks> w1{};
+    alignas(64) std::array<std::int16_t, kBlocks> w2{};
+    alignas(64) std::array<std::int16_t, kBlocks> w3{};
 
-struct alignas(64) ThreadState {
-    std::array<std::int16_t, kNodes> mag{};
-    std::array<std::uint16_t, kNodes> ph{};
-    std::array<std::int16_t, kNodes> omega{};  // per-node natural frequency detuning (Kuramoto)
-    std::array<std::int8_t, kNodes> ei{};      // per-node E/I identity: +1 excitatory, -1 inhibitory
-    NdShape shape{};
-    NdVectorKernel nd_kernel{};
-    alignas(64) std::array<std::int16_t, kNodes> scratch{};
-    alignas(64) std::array<std::uint16_t, kNodes> scratch_phase{};
+    alignas(64) std::array<std::uint16_t, kBlocks> block_flags{};
+    // bit 0: safe for AVX2 (all offsets in bounds)
+    // bit 1: active (has nonzero weights)
+    // bits 2-7: reserved for future topology metadata
+
+    // === Per-node gene fields (evolved, not global) ===
+    alignas(64) std::array<std::int16_t, kNodes> g_coupling{};
+    alignas(64) std::array<std::int16_t, kNodes> g_blend{};
+    alignas(64) std::array<std::int16_t, kNodes> g_decay{};
+
+    // === Diagnostic / telemetry ===
+    alignas(64) std::array<std::int16_t, kNodes> stress{};
+    alignas(64) std::array<std::int16_t, kNodes> novelty{};
+
+    // === Double buffer for synchronous stencil ===
+    alignas(64) std::array<std::int16_t, kNodes> scratch_mag{};
+    alignas(64) std::array<std::uint16_t, kNodes> scratch_ph{};
+
+    // === Legacy compatibility ===
     std::array<std::uint64_t, 4> nd{};
     std::uint32_t rng{0};
     std::uint64_t tick_counter{0};
@@ -166,7 +159,7 @@ public:
                  std::int16_t gain_q8 = 64);
 
     // Clone FULL lane state for probe isolation:
-    // ThreadState + ControllerState + Observation + Genome (atomic-safe)
+    // Lane2048 + ControllerState + Observation + Genome (atomic-safe)
     void clone_lane(std::size_t from, std::size_t to);
     void clone_lane_to(Engine& target, std::size_t from, std::size_t to) const;
 
@@ -184,7 +177,7 @@ private:
     mutable std::mutex mutex_;
     std::array<Genome, kThreads> genomes_{};
     std::array<Observation, kThreads> obs_{};
-    std::array<ThreadState, kThreads> data_{};
+    std::array<Lane2048, kThreads> data_{};
     std::array<ControllerState, kThreads> ctrl_{};
 };
 
