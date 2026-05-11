@@ -15,6 +15,10 @@ inline constexpr std::size_t kCrossoverEpochs = 4;  // crossover every N epochs
 inline constexpr std::size_t kMaxOffsets = 32;      // rank 4 * radius 4 * 2
 inline constexpr std::size_t kVectorLanes = 16;
 inline constexpr std::size_t kVectorBlocks = kNodes / kVectorLanes;
+inline constexpr std::size_t kTopologyFanIn = 4;
+inline constexpr std::uint16_t kTopoFlagLive = 1u << 0;
+inline constexpr std::uint16_t kTopoFlagBoundaryCompressed = 1u << 1;
+inline constexpr std::uint16_t kTopoFlagMutated = 1u << 2;
 
 struct alignas(64) Genome {
     std::atomic<std::int16_t> delta{17};
@@ -116,7 +120,22 @@ struct alignas(64) NdVectorKernel {
     std::uint16_t vector_end{0};
 };
 
+// Single-layer nDxnD topology embedded as lane-local vector execution data.
+// One SIMD block == 16 nodes. Each block carries executable offsets, Q15
+// weights, and flags; this turns nD geometry into living lane-local state rather
+// than an external slow/fast compiler plan.
+struct alignas(64) Topology2048 {
+    std::uint8_t rank{1};
+    std::uint8_t radius{1};
+    std::uint16_t active_nodes{2048};
+    std::uint16_t active_blocks{kVectorBlocks};
+    std::array<std::array<std::int16_t, kVectorBlocks>, kTopologyFanIn> block_offset{};
+    std::array<std::array<std::int16_t, kVectorBlocks>, kTopologyFanIn> block_weight_q15{};
+    std::array<std::uint16_t, kVectorBlocks> block_flags{};
+};
+
 NdVectorKernel build_nd_vector_plan(const NdShape& shape, std::int16_t radius);
+Topology2048 make_topology2048(const NdShape& shape, std::int16_t radius);
 
 struct alignas(64) ThreadState {
     std::array<std::int16_t, kNodes> mag{};
@@ -125,12 +144,30 @@ struct alignas(64) ThreadState {
     std::array<std::int8_t, kNodes> ei{};      // per-node E/I identity: +1 excitatory, -1 inhibitory
     NdShape shape{};
     NdVectorKernel nd_kernel{};
+    Topology2048 topology{};
     alignas(64) std::array<std::int16_t, kNodes> scratch{};
     alignas(64) std::array<std::uint16_t, kNodes> scratch_phase{};
     std::array<std::uint64_t, 4> nd{};
     std::uint32_t rng{0};
     std::uint64_t tick_counter{0};
 };
+
+void mutate_topology2048(Topology2048& topology, std::uint32_t& rng, std::uint16_t heat_q8);
+std::int64_t advance_topology2048_scalar(ThreadState& state,
+                                         const Topology2048& topology,
+                                         std::int16_t delta,
+                                         std::int16_t coupling,
+                                         std::int16_t blend,
+                                         std::int16_t decay);
+
+#if defined(__AVX2__)
+std::int64_t advance_topology2048_avx2(ThreadState& state,
+                                       const Topology2048& topology,
+                                       std::int16_t delta,
+                                       std::int16_t coupling,
+                                       std::int16_t blend,
+                                       std::int16_t decay);
+#endif
 
 class Engine {
 public:
