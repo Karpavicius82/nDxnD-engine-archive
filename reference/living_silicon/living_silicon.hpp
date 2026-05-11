@@ -12,6 +12,9 @@ inline constexpr std::size_t kNodes = 2048;
 inline constexpr std::size_t kThreads = 8;
 inline constexpr std::uint64_t kEpochMask = 0x7f;
 inline constexpr std::size_t kCrossoverEpochs = 4;  // crossover every N epochs
+inline constexpr std::size_t kMaxOffsets = 32;      // rank 4 * radius 4 * 2
+inline constexpr std::size_t kVectorLanes = 16;
+inline constexpr std::size_t kVectorBlocks = kNodes / kVectorLanes;
 
 struct alignas(64) Genome {
     std::atomic<std::int16_t> delta{17};
@@ -101,12 +104,27 @@ struct alignas(64) NdShape {
     std::uint8_t wrap_mask{0x0F};
 };
 
+struct alignas(64) NdVectorKernel {
+    std::uint8_t rank{1};
+    std::uint8_t radius{1};
+    std::uint16_t active_nodes{2048};
+    std::uint16_t offset_count{0};
+    std::array<std::int16_t, kMaxOffsets> offsets{};
+    std::array<std::int16_t, kMaxOffsets> weights_q15{};
+    std::array<std::uint8_t, kVectorBlocks> vector_block_safe{};
+    std::uint16_t vector_begin{0};
+    std::uint16_t vector_end{0};
+};
+
+NdVectorKernel build_nd_vector_plan(const NdShape& shape, std::int16_t radius);
+
 struct alignas(64) ThreadState {
     std::array<std::int16_t, kNodes> mag{};
     std::array<std::uint16_t, kNodes> ph{};
     std::array<std::int16_t, kNodes> omega{};  // per-node natural frequency detuning (Kuramoto)
     std::array<std::int8_t, kNodes> ei{};      // per-node E/I identity: +1 excitatory, -1 inhibitory
     NdShape shape{};
+    NdVectorKernel nd_kernel{};
     alignas(64) std::array<std::int16_t, kNodes> scratch{};
     alignas(64) std::array<std::uint16_t, kNodes> scratch_phase{};
     std::array<std::uint64_t, 4> nd{};

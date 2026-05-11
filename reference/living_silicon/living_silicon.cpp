@@ -1,4 +1,4 @@
-#include "control/living_silicon.hpp"
+#include "living_silicon.hpp"
 
 #include <algorithm>
 #include <array>
@@ -105,21 +105,21 @@ void store_shape_to_genome(Genome &genome, const NdShape &shape) {
                              std::memory_order_relaxed);
 }
 
-std::int64_t advance_lane_nd_scalar(ThreadState &state, const NdShape &shape,
-                                    const std::size_t active_nodes,
-                                    const std::int16_t delta,
-                                    const std::int16_t coupling,
-                                    const std::int16_t blend,
-                                    const std::int16_t decay,
-                                    const std::int16_t radius) {
-  std::copy_n(state.mag.begin(), active_nodes, state.scratch.begin());
-  std::copy_n(state.ph.begin(), active_nodes, state.scratch_phase.begin());
-
+std::int64_t advance_lane_nd_scalar_range(ThreadState &state,
+                                          const NdShape &shape,
+                                          const std::size_t begin,
+                                          const std::size_t end,
+                                          const std::int16_t delta,
+                                          const std::int16_t coupling,
+                                          const std::int16_t blend,
+                                          const std::int16_t decay,
+                                          const std::int16_t radius) {
   const int rank = std::clamp<int>(shape.rank, 1, 4);
   const int stencil_radius = std::clamp<int>(radius, 1, 4);
+  const auto active_nodes = nd_node_count(shape);
   std::int64_t tick_energy = 0;
 
-  for (std::size_t j = 0; j < active_nodes; ++j) {
+  for (std::size_t j = begin; j < end; ++j) {
     std::uint16_t coord[4]{0, 0, 0, 0};
     std::size_t rem = j;
     for (int axis = rank - 1; axis >= 0; --axis) {
@@ -195,6 +195,19 @@ std::int64_t advance_lane_nd_scalar(ThreadState &state, const NdShape &shape,
   return tick_energy;
 }
 
+std::int64_t advance_lane_nd_scalar(ThreadState &state, const NdShape &shape,
+                                    const std::size_t active_nodes,
+                                    const std::int16_t delta,
+                                    const std::int16_t coupling,
+                                    const std::int16_t blend,
+                                    const std::int16_t decay,
+                                    const std::int16_t radius) {
+  std::copy_n(state.mag.begin(), active_nodes, state.scratch.begin());
+  std::copy_n(state.ph.begin(), active_nodes, state.scratch_phase.begin());
+  return advance_lane_nd_scalar_range(state, shape, 0, active_nodes, delta,
+                                      coupling, blend, decay, radius);
+}
+
 #if defined(__AVX2__)
 // Pure SIMD horizontal absolute sum — matches V3 original (zero store-to-load
 // penalty)
@@ -210,9 +223,232 @@ std::int64_t hsum_abs16(__m256i v) {
   s = _mm_add_epi32(s, _mm_srli_si128(s, 4));
   return _mm_cvtsi128_si32(s);
 }
+
+__m256i loadu256(const void *ptr) {
+  return _mm256_loadu_si256(reinterpret_cast<const __m256i *>(ptr));
+}
+
+std::int64_t advance_lane_nd_vector(ThreadState &state,
+                                    const NdVectorKernel &kernel,
+                                    const std::int16_t delta,
+                                    const std::int16_t coupling,
+                                    const std::int16_t blend,
+                                    const std::int16_t decay) {
+  const auto active_nodes = static_cast<std::size_t>(kernel.active_nodes);
+  if (kernel.offset_count == 0 || kernel.vector_begin >= kernel.vector_end) {
+    return advance_lane_nd_scalar_range(state, state.shape, 0, active_nodes,
+                                        delta, coupling, blend, decay,
+                                        kernel.radius);
+  }
+
+  std::int64_t tick_energy = 0;
+  const auto vector_begin = static_cast<std::size_t>(kernel.vector_begin);
+  const auto vector_end = static_cast<std::size_t>(kernel.vector_end);
+
+  tick_energy += advance_lane_nd_scalar_range(state, state.shape, 0,
+                                              vector_begin, delta, coupling,
+                                              blend, decay, kernel.radius);
+
+  const __m256i zero_v = _mm256_setzero_si256();
+  const __m256i delta_v = _mm256_set1_epi16(delta);
+  const __m256i coupling_v = _mm256_set1_epi16(coupling);
+  const __m256i blend32_v = _mm256_set1_epi32(static_cast<int>(blend));
+  const __m256i inv_blend32_v =
+      _mm256_set1_epi32(static_cast<int>(256 - blend));
+
+  const auto sign_extend_i16_to_i32 =
+      [&](const __m256i v, __m256i &lo, __m256i &hi) noexcept {
+        const __m256i sign = _mm256_cmpgt_epi16(zero_v, v);
+        lo = _mm256_unpacklo_epi16(v, sign);
+        hi = _mm256_unpackhi_epi16(v, sign);
+      };
+  const auto zero_extend_u16_to_i32 =
+      [&](const __m256i v, __m256i &lo, __m256i &hi) noexcept {
+        lo = _mm256_unpacklo_epi16(v, zero_v);
+        hi = _mm256_unpackhi_epi16(v, zero_v);
+      };
+  const auto blend_phase_q8 = [&](const __m256i p,
+                                  const __m256i pn) noexcept -> __m256i {
+    __m256i p_lo, p_hi, pn_lo, pn_hi;
+    zero_extend_u16_to_i32(p, p_lo, p_hi);
+    zero_extend_u16_to_i32(pn, pn_lo, pn_hi);
+    const __m256i sum_lo = _mm256_add_epi32(
+        _mm256_mullo_epi32(p_lo, blend32_v),
+        _mm256_mullo_epi32(pn_lo, inv_blend32_v));
+    const __m256i sum_hi = _mm256_add_epi32(
+        _mm256_mullo_epi32(p_hi, blend32_v),
+        _mm256_mullo_epi32(pn_hi, inv_blend32_v));
+    return _mm256_packus_epi32(_mm256_srli_epi32(sum_lo, 8),
+                               _mm256_srli_epi32(sum_hi, 8));
+  };
+  const auto blend_mag_q8 = [&](const __m256i m,
+                                const __m256i mn) noexcept -> __m256i {
+    __m256i m_lo, m_hi, mn_lo, mn_hi;
+    sign_extend_i16_to_i32(m, m_lo, m_hi);
+    sign_extend_i16_to_i32(mn, mn_lo, mn_hi);
+    const __m256i sum_lo = _mm256_add_epi32(
+        _mm256_mullo_epi32(m_lo, blend32_v),
+        _mm256_mullo_epi32(mn_lo, inv_blend32_v));
+    const __m256i sum_hi = _mm256_add_epi32(
+        _mm256_mullo_epi32(m_hi, blend32_v),
+        _mm256_mullo_epi32(mn_hi, inv_blend32_v));
+    return _mm256_packs_epi32(_mm256_srai_epi32(sum_lo, 8),
+                              _mm256_srai_epi32(sum_hi, 8));
+  };
+
+  for (std::size_t i = vector_begin; i < vector_end; i += 16) {
+    const auto block = i / kVectorLanes;
+    if (block >= kernel.vector_block_safe.size() ||
+        kernel.vector_block_safe[block] == 0) {
+      tick_energy += advance_lane_nd_scalar_range(
+          state, state.shape, i, std::min<std::size_t>(i + kVectorLanes,
+                                                       active_nodes),
+          delta, coupling, blend, decay, kernel.radius);
+      continue;
+    }
+
+    const __m256i m = loadu256(state.scratch.data() + i);
+    __m256i p = loadu256(state.scratch_phase.data() + i);
+    const __m256i omega = loadu256(state.omega.data() + i);
+    p = _mm256_add_epi16(p, _mm256_add_epi16(delta_v, omega));
+
+    __m256i acc_mag_lo = _mm256_setzero_si256();
+    __m256i acc_mag_hi = _mm256_setzero_si256();
+    __m256i acc_phase_lo = _mm256_setzero_si256();
+    __m256i acc_phase_hi = _mm256_setzero_si256();
+
+    for (std::size_t k = 0; k < kernel.offset_count; ++k) {
+      const auto offset = static_cast<std::ptrdiff_t>(kernel.offsets[k]);
+      const __m256i weight_v =
+          _mm256_set1_epi32(static_cast<int>(kernel.weights_q15[k]));
+      const auto base = static_cast<std::ptrdiff_t>(i) + offset;
+      const __m256i nm = loadu256(state.scratch.data() + base);
+      __m256i np = loadu256(state.scratch_phase.data() + base);
+      const __m256i nomega = loadu256(state.omega.data() + base);
+      np = _mm256_add_epi16(np, _mm256_add_epi16(delta_v, nomega));
+
+      __m256i nm_lo, nm_hi, np_lo, np_hi;
+      sign_extend_i16_to_i32(nm, nm_lo, nm_hi);
+      zero_extend_u16_to_i32(np, np_lo, np_hi);
+      acc_mag_lo =
+          _mm256_add_epi32(acc_mag_lo, _mm256_mullo_epi32(nm_lo, weight_v));
+      acc_mag_hi =
+          _mm256_add_epi32(acc_mag_hi, _mm256_mullo_epi32(nm_hi, weight_v));
+      acc_phase_lo = _mm256_add_epi32(
+          acc_phase_lo, _mm256_mullo_epi32(np_lo, weight_v));
+      acc_phase_hi = _mm256_add_epi32(
+          acc_phase_hi, _mm256_mullo_epi32(np_hi, weight_v));
+    }
+
+    const __m256i mn = _mm256_packs_epi32(_mm256_srai_epi32(acc_mag_lo, 15),
+                                          _mm256_srai_epi32(acc_mag_hi, 15));
+    const __m256i pn =
+        _mm256_packus_epi32(_mm256_srli_epi32(acc_phase_lo, 15),
+                            _mm256_srli_epi32(acc_phase_hi, 15));
+
+    __m256i pb = blend_phase_q8(p, pn);
+    __m256i mb = blend_mag_q8(m, mn);
+
+    const __m256i quarter_v = _mm256_set1_epi16(16384);
+    const __m256i sg = _mm256_srai_epi16(_mm256_add_epi16(pb, quarter_v), 15);
+    const __m256i c = _mm256_sub_epi16(_mm256_xor_si256(coupling_v, sg), sg);
+    const __m256i ei =
+        _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i *>(
+            state.ei.data() + i)));
+    mb = _mm256_adds_epi16(mb, _mm256_sign_epi16(c, ei));
+    if (decay > 0) {
+      mb = _mm256_sub_epi16(mb, _mm256_srai_epi16(mb, decay));
+    }
+
+    _mm256_storeu_si256(reinterpret_cast<__m256i *>(state.mag.data() + i), mb);
+    _mm256_storeu_si256(reinterpret_cast<__m256i *>(state.ph.data() + i), pb);
+    tick_energy += hsum_abs16(mb);
+  }
+
+  tick_energy += advance_lane_nd_scalar_range(
+      state, state.shape, vector_end, active_nodes, delta, coupling, blend,
+      decay, kernel.radius);
+  return tick_energy;
+}
 #endif
 
 } // namespace
+
+NdVectorKernel build_nd_vector_plan(const NdShape &shape,
+                                    const std::int16_t radius) {
+  NdVectorKernel kernel{};
+  kernel.rank = static_cast<std::uint8_t>(std::clamp<int>(shape.rank, 1, 4));
+  kernel.radius = static_cast<std::uint8_t>(std::clamp<int>(radius, 1, 4));
+  kernel.active_nodes = static_cast<std::uint16_t>(nd_node_count(shape));
+
+  for (int axis = 0; axis < kernel.rank; ++axis) {
+    const auto stride = static_cast<int>(shape.stride[axis]);
+    for (int r = 1; r <= kernel.radius; ++r) {
+      if (kernel.offset_count + 2 > kMaxOffsets) {
+        break;
+      }
+      const auto offset = r * stride;
+      kernel.offsets[kernel.offset_count++] =
+          static_cast<std::int16_t>(-offset);
+      kernel.offsets[kernel.offset_count++] =
+          static_cast<std::int16_t>(offset);
+    }
+  }
+
+  if (kernel.offset_count > 0) {
+    const auto base_weight = static_cast<std::int16_t>(
+        32768 / static_cast<int>(kernel.offset_count));
+    auto remainder = 32768 - static_cast<int>(base_weight) *
+                                 static_cast<int>(kernel.offset_count);
+    for (std::size_t i = 0; i < kernel.offset_count; ++i) {
+      kernel.weights_q15[i] =
+          static_cast<std::int16_t>(base_weight + (remainder > 0 ? 1 : 0));
+      if (remainder > 0) {
+        --remainder;
+      }
+    }
+  }
+
+  std::size_t guard = 0;
+  for (int axis = 0; axis < kernel.rank; ++axis) {
+    guard = std::max<std::size_t>(
+        guard, static_cast<std::size_t>(kernel.radius) * shape.stride[axis]);
+  }
+
+  const auto aligned_begin = (guard + 15U) & ~std::size_t{15U};
+  const auto aligned_end =
+      (static_cast<std::size_t>(kernel.active_nodes) > guard)
+          ? ((static_cast<std::size_t>(kernel.active_nodes) - guard) &
+             ~std::size_t{15U})
+          : 0U;
+  if (aligned_begin < aligned_end) {
+    kernel.vector_begin = static_cast<std::uint16_t>(aligned_begin);
+    kernel.vector_end = static_cast<std::uint16_t>(aligned_end);
+  }
+
+  for (std::size_t i = kernel.vector_begin; i < kernel.vector_end;
+       i += kVectorLanes) {
+    bool safe = true;
+    for (std::size_t lane = 0; lane < kVectorLanes && safe; ++lane) {
+      std::size_t rem = i + lane;
+      for (int axis = kernel.rank - 1; axis >= 0; --axis) {
+        const auto stride = static_cast<std::size_t>(shape.stride[axis]);
+        const auto coord = static_cast<int>(rem / stride);
+        rem %= stride;
+        const auto dim = static_cast<int>(std::max<std::uint16_t>(
+            shape.dims[axis], static_cast<std::uint16_t>(1)));
+        if (coord < kernel.radius || coord + kernel.radius >= dim) {
+          safe = false;
+          break;
+        }
+      }
+    }
+    if (safe) {
+      kernel.vector_block_safe[i / kVectorLanes] = 1;
+    }
+  }
+  return kernel;
+}
 
 Engine::Engine() { initialize(0xC0FFEEULL); }
 
@@ -248,6 +484,7 @@ void Engine::initialize(const std::uint64_t seed) {
     state.tick_counter = 0;
     std::uint16_t default_dims[4]{2048, 1, 1, 1};
     state.shape = make_shape(1, default_dims, true);
+    state.nd_kernel = build_nd_vector_plan(state.shape, 1);
     for (auto &word : state.nd) {
       word =
           (static_cast<std::uint64_t>(xorshift32(rng)) << 32) | xorshift32(rng);
@@ -361,6 +598,9 @@ void Engine::advance_lane(const std::size_t lane) {
   const auto kernel_radius = genome.kernel_radius.load(std::memory_order_relaxed);
   const auto shape = state.shape;
   const auto active_nodes = nd_node_count(shape);
+  if (is_epoch) {
+    state.nd_kernel = build_nd_vector_plan(shape, kernel_radius);
+  }
 
   if (shape.rank <= 1 || active_nodes <= 1) {
 // AVX2 path — Kuramoto omega + E/I coupling + correct Q8 blend
@@ -509,8 +749,16 @@ void Engine::advance_lane(const std::size_t lane) {
 #endif
 
   } else {
-    tick_energy = advance_lane_nd_scalar(state, shape, active_nodes, delta,
-                                         coupling, blend, decay, kernel_radius);
+    std::copy_n(state.mag.begin(), active_nodes, state.scratch.begin());
+    std::copy_n(state.ph.begin(), active_nodes, state.scratch_phase.begin());
+#if defined(__AVX2__)
+    tick_energy = advance_lane_nd_vector(state, state.nd_kernel, delta,
+                                         coupling, blend, decay);
+#else
+    tick_energy = advance_lane_nd_scalar_range(state, shape, 0, active_nodes,
+                                               delta, coupling, blend, decay,
+                                               kernel_radius);
+#endif
   }
 
   obs.energy = tick_energy;
@@ -775,6 +1023,8 @@ void Engine::maybe_mutate(const std::size_t lane,
       break;
     }
 
+    state.nd_kernel = build_nd_vector_plan(
+        state.shape, genome.kernel_radius.load(std::memory_order_relaxed));
     genome.generation.fetch_add(1, std::memory_order_relaxed);
     genome.total_mutations.fetch_add(1, std::memory_order_relaxed);
     obs.mutations += 1;
@@ -874,6 +1124,8 @@ void Engine::maybe_crossover() {
     store_shape_to_genome(gw, data_[worst].shape);
     gw.kernel_radius.store(gb.kernel_radius.load(std::memory_order_relaxed),
                            std::memory_order_relaxed);
+    data_[worst].nd_kernel = build_nd_vector_plan(
+        data_[worst].shape, gw.kernel_radius.load(std::memory_order_relaxed));
   }
   // Reset worst stagnation so it gets a fair chance
   obs_[worst].stagnation_epochs = 0;
